@@ -120,6 +120,8 @@ const runtimeState = {
         suspiciousStreak: 0,
         stopRequested: false,
     },
+    // Shown in the status line: which prefill the last generation used, or why none was used.
+    lastPrefillReport: '',
 };
 
 function clearPostStopDomFixTimer() {
@@ -3028,6 +3030,7 @@ async function onChatCompletionSettingsReady(generateData) {
         injected = await injectStructuredPrefill(generateData, settings);
     } catch (err) {
         console.error(`[${extensionName}] Failed to apply structured prefill; sending the request unchanged.`, err);
+        reportPrefill('not applied, an error occurred (see browser console).');
     }
     if (!injected) {
         generateData.messages.length = 0;
@@ -3043,9 +3046,15 @@ async function onChatCompletionSettingsReady(generateData) {
 async function injectStructuredPrefill(generateData, settings) {
     const support = getStructuredOutputSupport(generateData);
     if (!support.supported) return false;
-    if (generateData.json_schema) return false;
+    if (generateData.json_schema) {
+        reportPrefill('not applied, the request already has a JSON schema.');
+        return false;
+    }
     // Avoid conflicts with tool-calling in early testing; can be revisited later.
-    if (Array.isArray(generateData.tools) && generateData.tools.length > 0) return false;
+    if (Array.isArray(generateData.tools) && generateData.tools.length > 0) {
+        reportPrefill('not applied, the request uses tool calling.');
+        return false;
+    }
 
     const requestType = String(generateData.type ?? '').toLowerCase();
 
@@ -3105,6 +3114,9 @@ async function injectStructuredPrefill(generateData, settings) {
     const historyTail = tailIsChatHistory ? tail : null;
     const hasPromptPrefill = tail?.role === 'assistant' && !tailIsChatHistory;
     const replacementPrefill = isContinue ? '' : (overridePrefillText || (hasPromptPrefill ? '' : assistantPrefillField));
+    const prefillSource = overridePrefillText
+        ? 'the Prefill box'
+        : (hasPromptPrefill ? "your chat preset's last assistant prompt" : '"Start Claude\'s answer with"');
     if (replacementPrefill) {
         if (hasPromptPrefill) {
             tail.content = replacementPrefill;
@@ -3114,12 +3126,21 @@ async function injectStructuredPrefill(generateData, settings) {
             tailIndex = messages.length - 1;
         }
     } else if (tailIsChatHistory) {
+        reportPrefill('no prefill. The last message is the previous AI reply (chat history), so nothing was forced.');
         return false;
     }
 
-    if (!tail || tail.role !== 'assistant' || typeof tail.content !== 'string') return false;
+    if (!tail || tail.role !== 'assistant' || typeof tail.content !== 'string') {
+        reportPrefill(isContinue
+            ? 'Continue not applied, no AI message to continue.'
+            : `no prefill detected. The last prompt is ${tail?.role ?? 'missing'}-role; a preset prefill must be an assistant-role prompt placed last.`);
+        return false;
+    }
     let tailContent = tail.content;
-    if (!tailContent) return false;
+    if (!tailContent) {
+        reportPrefill('no prefill detected. The trailing assistant prompt is empty.');
+        return false;
+    }
 
     // When ST's "Character Names Behavior" is set to "Message Content", all message contents
     // in the messages array get "CharName: " prepended (openai.js setOpenAIMessages).
@@ -3329,9 +3350,15 @@ async function injectStructuredPrefill(generateData, settings) {
 
         // Non-Continue: if we still end on assistant, it is another prefill (many providers reject that with
         // output formats). Ending on the previous AI reply is fine: that is plain chat history (group chats).
-        if (!isContinue && lastMsg?.role === 'assistant' && !(tailIsChatHistory && lastMsg === historyTail)) return false;
+        if (!isContinue && lastMsg?.role === 'assistant' && !(tailIsChatHistory && lastMsg === historyTail)) {
+            reportPrefill('not applied. After removing the prefill, the request still ends on another assistant prompt; merge or remove it.');
+            return false;
+        }
 
-        if (runtimeState.patternMode === 'anthropic' && lastMsg?.role !== 'user' && lastMsg?.role !== 'system') return false;
+        if (runtimeState.patternMode === 'anthropic' && lastMsg?.role !== 'user' && lastMsg?.role !== 'system') {
+            reportPrefill('not applied. This provider needs the request to end on a user message.');
+            return false;
+        }
     }
 
     const minCharsSetting = clampInt(settings.min_chars_after_prefix, 1, 10000, 80);
@@ -3359,6 +3386,9 @@ async function injectStructuredPrefill(generateData, settings) {
     runtimeState.stopSessionAt = 0;
     clearStopCleanupTimer();
     runtimeState.lastInjectedAt = Date.now();
+    reportPrefill(isContinue
+        ? 'Continue (enforced through the schema).'
+        : `prefill from ${prefillSource}: "${previewPrefill(tailContent)}"`);
 
     // If this generation updates an existing assistant message (e.g., swipes), seed the fallback with the
     // currently displayed content so early-abort / early-token cases don't blank the message.
@@ -3443,6 +3473,16 @@ function onGenerationStopped() {
     touchStopCleanup(messageId, runtimeState.stopSessionAt);
 }
 
+function previewPrefill(text, max = 60) {
+    const flat = String(text ?? '').replace(/\s+/g, ' ').trim();
+    return flat.length > max ? `${flat.slice(0, max)}…` : flat;
+}
+
+function reportPrefill(text) {
+    runtimeState.lastPrefillReport = text;
+    renderStatus();
+}
+
 // One-line answer to "is StructuredPrefill doing anything right now, and with which prefill?"
 function renderStatus() {
     const el = document.getElementById('structuredprefill_status');
@@ -3450,7 +3490,8 @@ function renderStatus() {
 
     const settings = extension_settings[extensionName];
     const setStatus = (active, text) => {
-        el.textContent = text;
+        const report = active ? runtimeState.lastPrefillReport : '';
+        el.textContent = report ? `${text}\nLast reply: ${report}` : text;
         el.classList.toggle('active', active);
         el.classList.toggle('inactive', !active);
     };
@@ -3472,7 +3513,7 @@ function renderStatus() {
     if (!support.supported) return setStatus(false, `Inactive: ${support.reason}`);
 
     const prefillSource = getOverridePrefillText(settings)
-        ? "this preset's prefill"
+        ? 'the Prefill box'
         : "the chat preset's prefill (a trailing assistant prompt), if it has one";
     setStatus(true, `Active for ${oai.chat_completion_source}${model ? ` / ${model}` : ''}, using ${prefillSource}.`);
 }

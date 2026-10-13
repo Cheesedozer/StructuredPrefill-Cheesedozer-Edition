@@ -94,6 +94,8 @@
     border-left: 3px solid var(--SmartThemeBorderColor);
     background-color: var(--black20a);
     font-size: 0.9em;
+    white-space: pre-line;
+    overflow-wrap: anywhere;
 }
 
 .structuredprefill-status:empty {
