@@ -5,9 +5,9 @@
     "optional": [],
     "js": "index.js",
     "css": "styles.css",
-    "author": "",
-    "version": "0.0.3",
-    "homePage": "https://rentry.org/structuredprefill",
+    "author": "Cheesedozer",
+    "version": "0.1.0",
+    "homePage": "https://github.com/Cheesedozer/StructuredPrefill-Cheesedozer-Edition",
     "description": "Prefill-like behavior using Structured Outputs (json_schema) instead of assistant-role prefills.",
     "auto_update": false
 }

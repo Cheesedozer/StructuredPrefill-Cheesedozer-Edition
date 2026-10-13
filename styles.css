@@ -86,3 +86,24 @@
     flex: 1 1 auto;
     min-width: 0;
 }
+
+.structuredprefill-status {
+    margin: 4px 0 6px;
+    padding: 5px 8px;
+    border-radius: 6px;
+    border-left: 3px solid var(--SmartThemeBorderColor);
+    background-color: var(--black20a);
+    font-size: 0.9em;
+}
+
+.structuredprefill-status:empty {
+    display: none;
+}
+
+.structuredprefill-status.active {
+    border-left-color: var(--okColor, #4caf50);
+}
+
+.structuredprefill-status.inactive {
+    border-left-color: var(--warning, #e0a030);
+}

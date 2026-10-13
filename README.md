@@ -34,12 +34,19 @@ That is the core difference. The model thinks it started the response that way o
 
 ***
 
+#### INSTALL
+
+In SillyTavern or SillyBunny: Extensions → Install extension → paste
+`https://github.com/Cheesedozer/StructuredPrefill-Cheesedozer-Edition`
+
+***
+
 #### HOW IT WORKS
 
-1. You add a final assistant message (your prefill)
+1. You set a prefill: either in the extension's **Prefill** box, or as a final assistant prompt in your preset's Prompt Manager ("Start Claude's answer with" also counts)
 2. StructuredPrefill removes it from the outgoing request
 3. It builds a JSON Schema with a regex pattern requiring the response to start with your prefill
-4. The model returns `{ "value": "<your prefill>...<continuation>" }`
+4. The model returns `{ "response": "<your prefill>...<continuation>" }`
 5. The extension unwraps the JSON so the chat looks and streams normally
 
 ![](https://desu-usergeneratedcontent.xyz/g/image/1771/57/1771576224775.png)
@@ -60,13 +67,13 @@ The model generates the prefix itself to satisfy the schema constraint. There is
 
 ![](https://desu-usergeneratedcontent.xyz/g/image/1774/82/1774821134008.png)
 
-**Enabled**
-Turns the extension on or off. When off, nothing changes. When on, it only activates if the current provider supports OpenAI-style JSON Schema structured outputs. If not supported it does nothing and your prompt goes through normally.
+**Enable StructuredPrefill**
+Turns the extension on or off. When on, it only activates if the current provider really enforces JSON Schema structured outputs (see COMPATIBILITY). Otherwise it does nothing and your prompt goes through normally.
+
+The line under the checkbox tells you whether it is active for your current API/model, and which prefill it will use. If it says "Inactive", it also says why.
 
 **Hide The Prefill Text In The Final Message**
-Display only. Does not change what the model outputs, only what you see in ST.
-
-When on, ST scans the streaming response and hides everything up to and including your prefill text, so you only see the continuation, so it's the same as how traditional prefills look.
+When on, the prefill part of the reply is hidden while streaming and removed from the saved message, so it looks like a traditional prefill and is not sent back to the model in later turns. This happens once, when the reply arrives: editing a message later never strips anything from it.
 
 Use `[[keep]]` inside your prefill to mark a cutoff point. Everything before `[[keep]]` gets hidden. Everything after stays visible to you AND the model.
 
@@ -78,15 +85,22 @@ Example prefill:
 ```
 The model sees and generates all of it. You only see `{{char}}` onward.
 
-**Schema**
+**Prefill**
+Tick "Use this prefill" and type your prefill here. This is the simplest setup and works with any chat preset. When unticked, StructuredPrefill uses your preset's own prefill instead: a final assistant-role prompt in the Prompt Manager, or "Start Claude's answer with".
 
-**Minimum characters after prefix**
+In group chats, or when you generate with an empty input box after an AI reply, the previous AI message is chat history and is never treated as a prefill.
+
+**Advanced**
+
+*Minimum characters after prefix*
 Hard constraint. Forces the model to generate at least N characters after the prefill before it is allowed to stop. Prevents the model from satisfying the schema with just the prefix and nothing else.
 
-Setting it too high makes the model ramble to hit the count and increases token cost. Setting it too low risks short completions. Around 80 is reasonable for most RP use.
+Setting it too high makes the model ramble to hit the count and increases token cost. Setting it too low risks short completions. Around 80 is reasonable for most RP use. With an anti-slop list the minimum is approximate (counted in words of about six characters).
 
-**Newline token**
-Some providers reject JSON schemas that contain literal newlines. StructuredPrefill replaces real newlines in your prefill with this token when building the schema, then converts them back for display. Default `\n` works unless your prefill already contains that string.
+*Continue overlap characters* (see CONTINUE / OVERLAP below)
+
+*Newline token*
+Some providers reject JSON schemas that contain literal newlines. StructuredPrefill replaces real newlines in your prefill with this token when building the schema, then converts them back for display. The default works unless your prefill already contains that exact text; a different token is picked automatically if it does.
 
 ***
 
@@ -107,7 +121,7 @@ This is the same as the manual trick of: generate first 10 words with uncensored
 **Dual preset use:**
 The prefill generator has its own system prompt. You can use this to have one model generate `<thinking>` content about what should happen next, then feed that output as the prefix for your main model to continue from.
 
-Configuration is in settings: pick a Connection Profile, set max tokens, stop strings, and timeout.
+Configuration is in settings: pick a Connection Profile, set max tokens, stop strings, and timeout. The profile's API, model, saved API key and reverse-proxy preset are used. Your main chat connection is not switched.
 
 If `[[pg]]` fails: it becomes empty string, you get an error toast, generation continues normally.
 
@@ -138,11 +152,11 @@ Lower = cheaper, less anchoring at the seam.
 
 #### ANTI-SLOP / BANNED WORDS
 
-One word per line. StructuredPrefill bakes a DFA-complement regex into the schema pattern. The model literally cannot output the banned character sequence. Not "probably won't." Cannot.
+One word or phrase per line. StructuredPrefill compiles the list into an automaton and bakes it into the schema pattern as a regex. On providers that enforce the pattern, the model literally cannot output a banned entry. Not "probably won't." Cannot.
 
 Case-insensitive. Banning `ozone` also blocks `Ozone` and `OZONE`.
 
-Banning a word blocks any string containing it. Banning `gaze` also blocks `gazed`, `gazes`, `gazelle`.
+A banned word is blocked wherever a word starts with it. Banning `gaze` blocks `gaze`, `gazed`, `gazes`, `gazelle`, but not `stargaze`. Entries that start with punctuation or a symbol, like `—` or `...`, are blocked everywhere. Entries are also blocked when they would be split between the end of your prefill and the start of the reply.
 
 Examples of things people ban:
 - `ozone` (Gemini LLMism)
@@ -152,7 +166,7 @@ Examples of things people ban:
 - `—` (em dash, Claude loves these)
 - `firmament`
 
-Keep the list reasonable. Each word adds to the pattern size and large patterns can cause providers to reject the schema.
+Keep the list reasonable. Each entry adds to the pattern size, and large patterns can make providers reject the schema. Multi-word phrases cost much more than single words. Around 20 single words is fine. For bigger lists, replies are required to end on punctuation, a space or a newline, which keeps the pattern smaller. If the list gets too large, anti-slop is switched off for that reply and you get a warning toast. Emoji can't be banned.
 
 ***
 
@@ -266,17 +280,26 @@ Want to use StructuredPrefill outside of sillytavern? Look here: ./proxy/README.
 
 #### COMPATIBILITY
 
-StructuredPrefill only works on providers that support OpenAI-style JSON Schema structured outputs for chat completions. Full list: https://openrouter.ai/models?fmt=cards&supported_parameters=structured_outputs
+Works in SillyTavern and SillyBunny with Chat Completion APIs whose backend turns the request's JSON Schema into real structured outputs. Model list for OpenRouter: https://openrouter.ai/models?fmt=cards&supported_parameters=structured_outputs
 
-If your provider does not support it, StructuredPrefill does nothing. Your prompt goes through unchanged.
+StructuredPrefill switches itself off (and the status line says why) on sources that would silently drop your prefill:
+
+| Source | Why it is skipped |
+|---|---|
+| AI21, DeepSeek, Moonshot, Z.AI, SiliconFlow | Only JSON mode, which cannot enforce a regex |
+| OpenAI Responses, MiniMax, anonymous Pollinations | The structured-output setting is ignored |
+| Direct Claude / LinkAPI Claude, except Claude Fable 5.1 in SillyBunny | Emulated with a forced tool call that does not enforce regex. Use OpenRouter for other Claude models |
+| CometAPI | Disabled by the host |
+
+Everything else (OpenAI, OpenRouter, Custom/OpenAI-compatible, Google AI Studio / Vertex, Mistral, Cohere, Groq, xAI, NanoGPT, Chutes, Electron Hub, AIML API, Fireworks, Perplexity, Azure OpenAI, Workers AI, LinkAPI non-Claude models) gets the schema. Whether a given model enforces the regex `pattern` is up to the provider.
 
 ***
 
 #### LIMITATIONS
 
-- **Direct Claude in SillyTavern is broken for this.** Anthropic uses a different request shape (`output_config.format`) and SillyTavern's current chat completions path does not expose a hook extensions can use. Cohee would need to update ST source code. OpenRouter Claude works fine.
+- Direct Claude only works for Claude Fable 5.1 in SillyBunny, which sends Anthropic's native structured outputs. Other direct Claude models get JSON Schema as a forced tool call, which does not enforce the pattern. OpenRouter Claude works fine.
 - Some "OpenAI-compatible" providers accept `json_schema` but do not enforce regex `pattern` constraints. StructuredPrefill may partially work or be a no-op on those.
 - JSON Schema regex support varies by provider. Keep stub patterns simple.
-- Very large prefills make the schema pattern huge. Some providers reject oversized schemas or get slow.
+- Very large prefills and anti-slop lists make the schema pattern huge. Some providers reject oversized schemas or get slow.
 - Stubs are experimental. Pushing too many constraints or complex patterns can cause unstable model behavior.
-- If generation gets interrupted mid-stream you may briefly see raw JSON depending on provider and ST streaming behavior.
+- If generation gets interrupted mid-stream you may briefly see raw JSON depending on provider and streaming behavior.

@@ -1,4 +1,7 @@
 import { chat, getRequestHeaders, messageFormatting, saveSettingsDebounced, scrollChatToBottom, updateMessageBlock } from '../../../../script.js';
+// Namespace imports for values that only some hosts export (a named import of a missing export would fail to load).
+import * as stScript from '../../../../script.js';
+import * as stOpenAi from '../../../openai.js';
 import { extension_settings } from '../../../extensions.js';
 import { ARGUMENT_TYPE, SlashCommandArgument } from '../../../slash-commands/SlashCommandArgument.js';
 import { enumIcons } from '../../../slash-commands/SlashCommandCommonEnumsProvider.js';
@@ -11,7 +14,17 @@ import { download, getFileText } from '../../../utils.js';
 const { eventSource, event_types, renderExtensionTemplateAsync, callPopup } = SillyTavern.getContext();
 
 const extensionName = 'StructuredPrefill';
-const extensionPath = 'third-party/StructuredPrefill';
+// The install folder is named after the git repo (e.g. `third-party/StructuredPrefill-Cheesedozer-Edition`),
+// so derive the template path from where this module was actually loaded from.
+const extensionPath = (() => {
+    try {
+        const match = /\/scripts\/extensions\/(.+)\/[^/]*$/.exec(new URL(import.meta.url).pathname);
+        if (match) return decodeURIComponent(match[1]);
+    } catch {
+        // ignore
+    }
+    return 'third-party/StructuredPrefill';
+})();
 const STREAM_MARKDOWN_FAST_INTERVAL_MS = 90;
 const STREAM_MARKDOWN_LARGE_INTERVAL_MS = 180;
 const STREAM_MARKDOWN_HUGE_INTERVAL_MS = 320;
@@ -61,7 +74,6 @@ const runtimeState = {
     lastInjectedAt: 0,
     latestStreamText: '',
     lastAppliedText: '',
-    expectedPrefill: '',
     newlineToken: '',
     patternMode: 'default',
     knownNames: [],
@@ -79,9 +91,7 @@ const runtimeState = {
         pmStripRegex: null,
         // Continue can require a small overlap prefix so the model "hooks" onto the existing text naturally.
         // We strip the overlap back out before appending to the base message.
-        overlapText: '',
         overlapStripLiteral: '',
-        overlapStripRegex: null,
         stripLiteral: '',
         stripRegex: null,
     },
@@ -236,7 +246,7 @@ function normalizePresetObject(rawPreset, fallbackName = 'Default') {
     preset.prefill_gen_extra_prompt = String(rawPreset?.prefill_gen_extra_prompt ?? defaultPresetSettings.prefill_gen_extra_prompt);
     preset.prefill_gen_extra_prompt_role = normalizePrefillGenExtraPromptRole(rawPreset?.prefill_gen_extra_prompt_role);
     preset.prefill_gen_profile_id = String(rawPreset?.prefill_gen_profile_id ?? defaultPresetSettings.prefill_gen_profile_id);
-    preset.prefill_gen_max_tokens = clampInt(rawPreset?.prefill_gen_max_tokens, 1, 20000048, defaultPresetSettings.prefill_gen_max_tokens);
+    preset.prefill_gen_max_tokens = clampInt(rawPreset?.prefill_gen_max_tokens, 1, 2048, defaultPresetSettings.prefill_gen_max_tokens);
     preset.prefill_gen_stop = String(rawPreset?.prefill_gen_stop ?? defaultPresetSettings.prefill_gen_stop);
     preset.prefill_gen_keep_matched_stop_string = !!rawPreset?.prefill_gen_keep_matched_stop_string;
     preset.prefill_gen_timeout_ms = clampInt(rawPreset?.prefill_gen_timeout_ms, 500, 120000, defaultPresetSettings.prefill_gen_timeout_ms);
@@ -759,6 +769,20 @@ async function runPrefillGeneratorOrEmpty({
         payload.use_sysprompt = true;
     }
 
+    // Use the profile's saved API key and reverse proxy, like switching to the profile would.
+    const secretId = String(profile['secret-id'] ?? '').trim();
+    if (secretId) {
+        payload.secret_id = secretId;
+    }
+    const proxyName = String(profile.proxy ?? '').trim();
+    if (proxyName) {
+        const proxyPreset = (Array.isArray(stOpenAi?.proxies) ? stOpenAi.proxies : []).find(p => p?.name === proxyName);
+        if (proxyPreset?.url) {
+            payload.reverse_proxy = proxyPreset.url;
+            payload.proxy_password = proxyPreset.password ?? '';
+        }
+    }
+
     const controller = new AbortController();
     const configuredTimeoutMs = clampInt(timeoutMs, 500, 120000, 120000);
     const timer = setTimeout(() => controller.abort(), configuredTimeoutMs);
@@ -802,27 +826,51 @@ async function runPrefillGeneratorOrEmpty({
     }
 }
 
-function supportsStructuredPrefillForSource(chatCompletionSource) {
-    // IMPORTANT: We only activate on sources that (in SillyTavern server) apply `json_schema`
-    // as a real structured output mechanism (OpenAI-style `response_format: json_schema` or
-    // an equivalent JSON-schema response feature). Some sources translate `json_schema` to
-    // JSON-mode / prompt hacks or forced tooling, which would break this extension’s contract.
-    const src = String(chatCompletionSource ?? '').toLowerCase();
-    const incompatible = new Set([
-        // Tool-based or non-OpenAI response format.
-        'claude',
-        // These providers map `json_schema` to JSON mode / prompt hacks on the server.
-        'ai21',
-        'deepseek',
-        'moonshot',
-        'zai',
-        'siliconflow',
-        // Currently disabled server-side.
-        'cometapi',
-        '',
-    ]);
+const JSON_MODE_ONLY_SOURCES = new Set(['ai21', 'deepseek', 'moonshot', 'zai', 'siliconflow']);
+const SCHEMA_IGNORED_SOURCES = new Set(['openai_responses', 'minimax']);
 
-    return !incompatible.has(src);
+function isSillyBunnyHost() {
+    return /^SillyBunny/i.test(String(stScript?.CLIENT_VERSION ?? ''));
+}
+
+// Mirrors SillyBunny's linkapi-utils: Claude ids use the Anthropic relay, Gemini ids the Google relay.
+function getLinkApiFormat(model) {
+    const raw = String(model ?? '').trim();
+    if (raw.startsWith('[')) return 'openai';
+    const id = raw.toLowerCase().replace(/^.*\//, '');
+    if (id.includes('claude')) return 'anthropic';
+    if (id.includes('gemini')) return 'google';
+    return 'openai';
+}
+
+/**
+ * Whether the backend turns `json_schema` into real regex-enforced structured outputs for this request.
+ * Sources that only offer JSON mode, ignore the schema, or emulate it with a forced tool call would
+ * silently drop the prefill, so StructuredPrefill stays off there.
+ * @returns {{ supported: boolean, reason: string }}
+ */
+function getStructuredOutputSupport(generateData) {
+    const src = String(generateData?.chat_completion_source ?? '').toLowerCase();
+    const model = String(generateData?.model ?? '');
+    const no = (reason) => ({ supported: false, reason });
+
+    if (!src) return no('No Chat Completion source selected.');
+    if (JSON_MODE_ONLY_SOURCES.has(src)) return no('This provider only offers JSON mode, which cannot enforce a prefill.');
+    if (SCHEMA_IGNORED_SOURCES.has(src)) return no('This provider ignores structured outputs.');
+    if (src === 'cometapi') return no('This provider is disabled.');
+    if (src === 'pollinations' && String(generateData?.pollinations_endpoint ?? '') === 'anonymous') {
+        return no('Anonymous Pollinations ignores structured outputs.');
+    }
+
+    // Direct Claude (and LinkAPI's Claude relay) emulate json_schema with a forced tool call, which does not
+    // enforce regex patterns. SillyBunny sends native structured outputs for Claude Fable 5.1 only.
+    const viaAnthropic = src === 'claude' || (src === 'linkapi' && getLinkApiFormat(model) === 'anthropic');
+    if (viaAnthropic) {
+        if (/claude-fable-5-1/.test(model) && isSillyBunnyHost()) return { supported: true, reason: '' };
+        return no('Direct Claude only enforces structured outputs for Claude Fable 5.1 in SillyBunny. Use OpenRouter for other Claude models.');
+    }
+
+    return { supported: true, reason: '' };
 }
 
 function normalizeNewlines(text) {
@@ -955,7 +1003,7 @@ function looksLikeStructuredJsonBlob(text) {
     const s = String(text ?? '');
     if (!s.includes('{') || !s.includes('"')) return false;
     // Detect our JSON wrapper even if it appears *after* a Continue base message ("Foo... {\"response\":\"...\"}").
-    return /\{\s*"(?:response|value|prefix|content)"\s*:/.test(s);
+    return /\{\s*"response"\s*:/.test(s);
 }
 
 function clearHidePrefillState() {
@@ -970,9 +1018,7 @@ function clearContinueState() {
     runtimeState.continue.displayBase = '';
     runtimeState.continue.pmStripLiteral = '';
     runtimeState.continue.pmStripRegex = null;
-    runtimeState.continue.overlapText = '';
     runtimeState.continue.overlapStripLiteral = '';
-    runtimeState.continue.overlapStripRegex = null;
     runtimeState.continue.stripLiteral = '';
     runtimeState.continue.stripRegex = null;
 }
@@ -986,6 +1032,32 @@ function getLastAssistantMessageId() {
         return i;
     }
     return -1;
+}
+
+function stripKnownNamePrefix(text) {
+    const value = String(text ?? '');
+    const names = (runtimeState.knownNames ?? []).slice().sort((a, b) => b.length - a.length);
+    for (const name of names) {
+        if (name && value.startsWith(name + ': ')) return value.slice(name.length + 2);
+    }
+    return value;
+}
+
+/**
+ * True when a trailing assistant message in the outgoing prompt is the last chat message itself
+ * (group chats, or generating after an AI reply) rather than a Prompt Manager prefill.
+ */
+function isTailLastChatMessage(tailContent) {
+    const last = chat?.[chat.length - 1];
+    if (!last || last.is_user || last.is_system || typeof last.mes !== 'string') return false;
+
+    const squash = (s) => canonicalizeForContinueMatch(s).replace(/\s+/g, ' ').trim();
+    const mes = squash(last.mes);
+    if (!mes) return false;
+    const tail = squash(stripKnownNamePrefix(tailContent));
+    // The prompt can wrap the message (reasoning blocks, names, regex scripts), so containment is enough.
+    // Short messages need an exact match so a prefill like `<thinking>` isn't mistaken for a reply like "Hi".
+    return tail === mes || (mes.length >= 20 && tail.includes(mes));
 }
 
 function getActiveAssistantMessageIdForStreaming() {
@@ -1040,18 +1112,12 @@ function getDecodedValueForGuard(rawText) {
     const decode = (s) => decodeStructuredPrefillText(s, runtimeState.newlineToken);
     try {
         const parsed = JSON.parse(String(rawText ?? ''));
-        if (parsed && typeof parsed === 'object') {
-            if (typeof parsed.response === 'string') return decode(parsed.response);
-            if (typeof parsed.value === 'string') return decode(parsed.value);
-        }
+        if (typeof parsed?.response === 'string') return decode(parsed.response);
     } catch {
         // ignore
     }
     const response = tryExtractJsonStringField(String(rawText ?? ''), 'response');
-    if (typeof response === 'string') return decode(response);
-    const legacy = tryExtractJsonStringField(String(rawText ?? ''), 'value');
-    if (typeof legacy === 'string') return decode(legacy);
-    return null;
+    return typeof response === 'string' ? decode(response) : null;
 }
 
 function isSuspiciousPaddingDelta(delta) {
@@ -1251,20 +1317,12 @@ function buildContinueOverlapStripper(overlapText) {
 
     // Overlap is treated as a literal (no slots).
     runtimeState.continue.overlapStripLiteral = normalized;
-    runtimeState.continue.overlapStripRegex = null;
 }
 
 function stripContinueOverlapPrefix(text) {
     if (!runtimeState.continue.active) return text;
     if (typeof text !== 'string' || text.length === 0) return text;
     const normalized = normalizeNewlines(text);
-
-    if (runtimeState.continue.overlapStripRegex instanceof RegExp) {
-        const m = runtimeState.continue.overlapStripRegex.exec(normalized);
-        if (m && typeof m[1] === 'string') {
-            return normalized.slice(m[1].length);
-        }
-    }
 
     const literal = String(runtimeState.continue.overlapStripLiteral ?? '');
     if (literal && normalized.startsWith(literal)) {
@@ -1370,92 +1428,6 @@ function maybeHidePrefillForDisplay(text) {
     return normalized;
 }
 
-function storePrefillMetadataForMessage(messageId, prefixTemplate) {
-    if (typeof messageId !== 'number' || messageId < 0 || messageId >= chat.length) return;
-    const message = chat[messageId];
-    if (!message || message.is_user || message.is_system) return;
-
-    const prefix = String(prefixTemplate ?? '');
-    if (!prefix) return;
-
-    message.extra ??= {};
-    const meta = (message.extra.structuredprefill && typeof message.extra.structuredprefill === 'object')
-        ? message.extra.structuredprefill
-        : {};
-
-    const { hideTemplate, hasKeepMarker } = splitHidePrefillTemplate(prefix);
-    meta.prefixTemplate = prefix;
-    meta.hideTemplate = hideTemplate;
-    meta.hasKeepMarker = Boolean(hasKeepMarker);
-    message.extra.structuredprefill = meta;
-}
-
-function tryStripPrefixForDisplayFromTemplate(fullText, prefixTemplate) {
-    const normalized = normalizeNewlines(String(fullText ?? ''));
-    const prefix = normalizeNewlines(String(prefixTemplate ?? ''));
-    if (!normalized || !prefix) return normalized;
-
-    if (!prefixHasSlots(prefix)) {
-        return normalized.startsWith(prefix) ? normalized.slice(prefix.length) : normalized;
-    }
-
-    const prefixRegex = buildPrefixRegexFromWireTemplate(prefix);
-    try {
-        const re = new RegExp(`^((?:${prefixRegex}))`);
-        const m = re.exec(normalized);
-        if (m && typeof m[1] === 'string' && m[1].length > 0) {
-            return normalized.slice(m[1].length);
-        }
-    } catch {
-        // ignore
-    }
-
-    // Fallback: literal attempt even if slots exist (better than nothing).
-    return normalized.startsWith(prefix) ? normalized.slice(prefix.length) : normalized;
-}
-
-function onMessageUpdated(messageId) {
-    const settings = extension_settings[extensionName];
-    if (!settings?.enabled) return;
-    if (!settings?.hide_prefill_in_display) return;
-    if (typeof messageId !== 'number' || messageId < 0 || messageId >= chat.length) return;
-
-    const message = chat[messageId];
-    if (!message || message.is_user || message.is_system) return;
-
-    const meta = message.extra?.structuredprefill;
-    if (!meta || typeof meta !== 'object') return;
-    if (typeof message.mes !== 'string') return;
-
-    const hideTemplate = typeof meta.hideTemplate === 'string' ? meta.hideTemplate : '';
-    if (!hideTemplate) return;
-
-    const stripped = tryStripPrefixForDisplayFromTemplate(message.mes, hideTemplate);
-    message.extra ??= {};
-
-    // Strip the prefill from mes itself so it doesn't enter the AI's context.
-    // Also update the active swipe entry so it stays in sync.
-    if (stripped !== message.mes) {
-        message.mes = stripped;
-        if (Array.isArray(message.swipes) && message.swipe_id != null) {
-            message.swipes[message.swipe_id] = stripped;
-        }
-    }
-    // display_text is no longer needed when mes is already stripped.
-    if (Object.prototype.hasOwnProperty.call(message.extra, 'display_text')) {
-        delete message.extra.display_text;
-    }
-
-    try {
-        // Re-render so message edits don't permanently un-hide prefixes.
-        // IMPORTANT: must pass `message` — ST's updateMessageBlock accesses message.mes / message.extra.display_text
-        // and will throw if the message object is omitted.
-        updateMessageBlock(messageId, message);
-    } catch {
-        // ignore
-    }
-}
-
 function computeDisplayText(messageId, fullText) {
     const settings = extension_settings[extensionName];
     if (!settings?.hide_prefill_in_display) return fullText;
@@ -1526,36 +1498,6 @@ function stripContinuePrefix(text) {
         return normalized.slice(literal.length);
     }
 
-    const canonicalize = (s) => {
-        const input = normalizeNewlines(String(s ?? ''));
-        let out = '';
-        for (let i = 0; i < input.length; i++) {
-            const ch = input[i];
-            switch (ch) {
-                case '\u00A0': out += ' '; break; // nbsp
-                case '\u201C': // “
-                case '\u201D': // ”
-                    out += '"';
-                    break;
-                case '\u2018': // ‘
-                case '\u2019': // ’
-                    out += '\'';
-                    break;
-                case '\u2010': // ‐
-                case '\u2011': // ‑
-                case '\u2012': // ‒
-                case '\u2013': // –
-                case '\u2014': // —
-                    out += '-';
-                    break;
-                default:
-                    out += ch;
-                    break;
-            }
-        }
-        return out.toLowerCase();
-    };
-
     // Fallback for providers that don't strictly enforce the prefix regex (so we can't regex-strip reliably):
     // try to locate the end of the *existing* message text within the decoded value and strip up to it.
     const base = String(runtimeState.continue.baseText ?? '');
@@ -1606,15 +1548,6 @@ function stripContinuePrefix(text) {
             if (typeof candidate === 'string') return candidate;
         }
 
-        const candidate = (
-            tryTailLen(220) ??
-            tryTailLen(140) ??
-            tryTailLen(90) ??
-            tryTailLen(60) ??
-            tryTailLen(40)
-        );
-
-        if (typeof candidate === 'string') return candidate;
     }
 
     return normalized;
@@ -1731,94 +1664,353 @@ function getPatternModeForRequest(source, modelId) {
     return 'default';
 }
 
+// <anti-slop> Shared by index.js and proxy/src/structured-prefill-core.js; keep both copies identical (a proxy test checks).
+// ASCII letters and digits count as "inside a word" for anti-slop matching. Every other character is
+// treated as a word boundary, which can only block more, never less, and keeps the schema pattern small.
+const ANTI_SLOP_WORD_RANGES = [[0x30, 0x39], [0x41, 0x5A], [0x61, 0x7A]];
+const ANTI_SLOP_MAX_PATTERN_CHARS = 30000;
+// Above this size, drop the "reply may end mid-word" tail (it repeats the whole word tree) and
+// require replies to end on a non-word character instead (punctuation, space, newline, quote...).
+const ANTI_SLOP_TAIL_BUDGET_CHARS = 4000;
+
+function isAntiSlopWordChar(ch) {
+    const code = String(ch).charCodeAt(0);
+    return ANTI_SLOP_WORD_RANGES.some(([lo, hi]) => code >= lo && code <= hi);
+}
+
 /**
- * Build a DFA-complement regex from the anti-slop ban list.
- * Returns a regex group that matches one "step" (1+ chars) without completing
- * any banned word, or null if the list is empty / unsupported.
- * Usage: replace `(?:.|\\n)` with the returned group in the continuation.
+ * Build the continuation regex (everything after the enforced prefix) for the anti-slop ban list.
  *
- * Approach: build a trie of banned words, then convert it to a complement regex.
- * Each iteration of the outer group consumes 1+ chars without completing any banned word.
- * E.g. banning "gaze" → ([^gG]|[gG]([^aA]|[aA]([^zZ]|[zZ][^eE])))
+ * Matching rules (case-insensitive):
+ * - An entry that starts with a letter/digit is blocked wherever a word starts with it:
+ *   banning `gaze` blocks "gaze", "Gazed", "gazelle", but not "stargaze".
+ * - An entry that starts with anything else (`—`, `...`, `*`) is blocked everywhere.
+ * - Entries spanning the end of the prefix and the start of the reply are blocked too.
+ *
+ * The rules are compiled into a DFA, which is turned into a regex by state elimination around the
+ * "between words" state R:  continuation = START CYCLE{n,} TAIL
+ * - START: from the state the prefix leaves us in back to R (empty when the prefix ends in R),
+ * - CYCLE: one trip R -> ... -> R (roughly one word plus its trailing separator),
+ * - TAIL:  an optional unfinished trip, so the reply may end anywhere. Dropped for large lists (see
+ *          ANTI_SLOP_TAIL_BUDGET_CHARS), in which case the reply must end on a non-word character.
+ * `minChars` is approximate here: one CYCLE is counted as about six characters (rounded down).
+ *
+ * @param {string} banListStr Newline-separated banned words/phrases.
+ * @param {{ minChars?: number, patternMode?: string, prefixText?: string }} [opts]
+ * @returns {{ pattern: string|null, error: string }} `pattern` is null when there is nothing to ban or on error.
  */
-function buildAntiSlopContinuation(banListStr) {
-    const raw = String(banListStr ?? '');
-    if (!raw.trim()) return null;
-
+function buildAntiSlopContinuation(banListStr, opts = {}) {
+    const entries = [];
     const seen = new Set();
-    const words = [];
-    for (const line of raw.split('\n')) {
+    for (const line of String(banListStr ?? '').split(/\r?\n/)) {
         const entry = line.trim();
-        if (!entry || seen.has(entry.toLowerCase())) continue;
-        seen.add(entry.toLowerCase());
-        words.push(entry);
-    }
-    if (words.length === 0) return null;
-
-    // Build trie (keyed by lowercase)
-    const mkNode = () => ({ ch: new Map(), end: false });
-    const root = mkNode();
-    for (const word of words) {
-        let node = root;
-        for (const c of word) {
-            const k = c.toLowerCase();
-            if (!node.ch.has(k)) node.ch.set(k, mkNode());
-            node = node.ch.get(k);
+        if (!entry) continue;
+        if (/[\uD800-\uDFFF]/.test(entry)) {
+            return { pattern: null, error: `"${entry}" contains characters (like emoji) that anti-slop cannot ban.` };
         }
-        node.end = true;
+        const key = [...entry].map(ch => foldChar(ch)).join('');
+        if (seen.has(key)) continue;
+        seen.add(key);
+        entries.push(key);
+    }
+    if (entries.length === 0) return { pattern: null, error: '' };
+
+    function foldChar(ch) {
+        const lower = ch.toLowerCase();
+        return lower.length === 1 ? lower : ch;
+    }
+    const variantsOf = (key) => {
+        const out = new Set([key]);
+        for (const v of [key.toLowerCase(), key.toUpperCase()]) {
+            if (v.length === 1 && foldChar(v) === key) out.add(v);
+        }
+        return [...out];
+    };
+
+    // --- Trie of entries ----------------------------------------------------------------------
+    const children = [new Map()];
+    const terminal = [false];
+    for (const entry of entries) {
+        let node = 0;
+        for (const ch of entry) {
+            let next = children[node].get(ch);
+            if (next === undefined) {
+                next = children.length;
+                children.push(new Map());
+                terminal.push(false);
+                children[node].set(ch, next);
+            }
+            node = next;
+        }
+        terminal[node] = true;
     }
 
-    const escClass = (c) => (c === ']' || c === '\\' || c === '^' || c === '-') ? '\\' + c : c;
+    // Input symbols: each explicit character (case-folded), plus "any other word char" / "any other char".
+    const alphabet = [...new Set(entries.flatMap(e => [...e]))].sort();
+    const OTHER_WORD = '\u0000word';
+    const OTHER_NONWORD = '\u0000nonword';
+    const symbols = [...alphabet, OTHER_WORD, OTHER_NONWORD];
+    const symbolIsWord = (sym) => (sym === OTHER_WORD ? true : sym === OTHER_NONWORD ? false : isAntiSlopWordChar(sym));
 
-    // Recursively convert a trie node to a complement regex group.
-    // The returned group matches one "safe step" from this node's perspective.
-    function toRegex(node) {
-        if (node.ch.size === 0) return null; // leaf — no further constraints
+    // --- DFA by subset construction ----------------------------------------------------------
+    // State = active partial matches (trie nodes) + whether the previous char was a word char.
+    const stateKey = (nodes, prevWord) => `${prevWord ? 'w' : 'n'}:${nodes.join(',')}`;
+    const states = [];
+    const stateIndex = new Map();
+    const DEAD = -1;
+    const addState = (nodes, prevWord) => {
+        const key = stateKey(nodes, prevWord);
+        if (!stateIndex.has(key)) {
+            stateIndex.set(key, states.length);
+            states.push({ nodes, prevWord, next: new Map() });
+        }
+        return stateIndex.get(key);
+    };
+    const step = (state, sym) => {
+        const nextNodes = new Set();
+        for (const node of state.nodes) {
+            const child = children[node].get(sym);
+            if (child !== undefined) nextNodes.add(child);
+        }
+        const isWord = symbolIsWord(sym);
+        const rootChild = children[0].get(sym);
+        // Letter-initial entries may only start at a word start; others may start anywhere.
+        if (rootChild !== undefined && (!isWord || !state.prevWord)) nextNodes.add(rootChild);
+        for (const node of nextNodes) if (terminal[node]) return DEAD;
+        return addState([...nextNodes].sort((a, b) => a - b), isWord);
+    };
 
-        const excludes = []; // chars to exclude in the safe catch-all class
-        const branches = []; // branches for chars that start a potential match
+    let computed = 0;
+    const closeStates = () => {
+        for (; computed < states.length; computed++) {
+            for (const sym of symbols) states[computed].next.set(sym, step(states[computed], sym));
+            if (states.length > 5000) return false;
+        }
+        return true;
+    };
 
-        for (const [key, child] of node.ch) {
-            const lo = key.toLowerCase();
-            const up = key.toUpperCase();
-            const hasCase = lo !== up;
-            excludes.push(escClass(lo));
-            if (hasCase) excludes.push(escClass(up));
+    const ROOT = addState([], false);
+    if (!closeStates()) return { pattern: null, error: 'The ban list is too large to compile.' };
 
-            if (child.end) {
-                // This char completes a banned word — blocked by the exclude class.
-                // Even if the child has further children (longer words sharing this prefix),
-                // the shorter banned word already blocks this path.
-                continue;
+    // State the enforced prefix leaves us in, so entries can't be split across the boundary.
+    let startState = ROOT;
+    for (const raw of String(opts.prefixText ?? '')) {
+        const ch = foldChar(raw);
+        const sym = alphabet.includes(ch) ? ch : (isAntiSlopWordChar(raw) ? OTHER_WORD : OTHER_NONWORD);
+        const next = states[startState].next.get(sym);
+        // If the prefix itself contains a banned entry (it is user-written), just continue from a boundary.
+        startState = next === DEAD ? addState([], symbolIsWord(sym)) : next;
+        if (!closeStates()) return { pattern: null, error: 'The ban list is too large to compile.' };
+    }
+
+    // --- Regex helpers (null = matches nothing, '' = empty string) -------------------------
+    const info = new Map();
+    const make = (src, { atom = false, alt = false, opt = false } = {}) => {
+        if (!info.has(src)) info.set(src, { atom, alt, opt });
+        return src;
+    };
+    const isAtom = (r) => info.get(r)?.atom === true;
+    const hasAlt = (r) => info.get(r)?.alt === true;
+    const group = (r) => (isAtom(r) ? r : make(`(?:${r})`, { atom: true }));
+    const union = (a, b) => {
+        if (a === null) return b;
+        if (b === null || a === b) return a;
+        if (a === '' && b === '') return '';
+        if (a === '') return info.get(b)?.opt ? b : make(`${group(b)}?`, { opt: true });
+        if (b === '') return info.get(a)?.opt ? a : make(`${group(a)}?`, { opt: true });
+        return make(`${a}|${b}`, { alt: true });
+    };
+    const concat = (...parts) => {
+        if (parts.some(p => p === null)) return null;
+        const kept = parts.filter(p => p !== '');
+        if (kept.length === 0) return '';
+        if (kept.length === 1) return kept[0];
+        return make(kept.map(p => (hasAlt(p) ? group(p) : p)).join(''));
+    };
+    const star = (r) => (r === null || r === '' ? '' : make(`${group(r)}*`, { opt: true }));
+
+    const escClassChar = (code) => {
+        const ch = String.fromCharCode(code);
+        return /[\]\\^-]/.test(ch) ? `\\${ch}` : ch;
+    };
+    const rangesToClassBody = (ranges) => ranges
+        .map(([lo, hi]) => (lo === hi ? escClassChar(lo) : hi === lo + 1 ? `${escClassChar(lo)}${escClassChar(hi)}` : `${escClassChar(lo)}-${escClassChar(hi)}`))
+        .join('');
+    const subtractCodes = (ranges, codes) => {
+        let out = ranges.map(r => r.slice());
+        for (const code of [...codes].sort((a, b) => a - b)) {
+            const next = [];
+            for (const [lo, hi] of out) {
+                if (code < lo || code > hi) { next.push([lo, hi]); continue; }
+                if (lo <= code - 1) next.push([lo, code - 1]);
+                if (code + 1 <= hi) next.push([code + 1, hi]);
             }
+            out = next;
+        }
+        return out;
+    };
+    const codesOf = (keys) => keys.flatMap(variantsOf).map(ch => ch.charCodeAt(0));
+    const codeRanges = (codes) => [...new Set(codes)].sort((a, b) => a - b).map(c => [c, c]);
 
-            // Not end — recurse deeper
-            const charExpr = hasCase ? `[${up}${lo}]` : escClass(key);
-            const sub = toRegex(child);
-            if (sub) {
-                branches.push(`${charExpr}${sub}`);
-            } else {
-                // Child is a leaf but not end — shouldn't happen, but treat as safe
-                branches.push(charExpr);
+    // Regex for one edge label: a set of symbols that all lead to the same target state.
+    const labelFor = (syms) => {
+        const set = new Set(syms);
+        const explicitIn = alphabet.filter(ch => set.has(ch));
+        const explicitOut = alphabet.filter(ch => !set.has(ch));
+        const parts = [];
+        if (set.has(OTHER_NONWORD)) {
+            // Everything except: word chars not in this label, and explicit chars not in this label.
+            // Word chars outside the label are already covered by the word ranges when those are excluded.
+            const excludedWord = set.has(OTHER_WORD) ? [] : ANTI_SLOP_WORD_RANGES;
+            const excludedExplicit = set.has(OTHER_WORD) ? explicitOut : explicitOut.filter(ch => !isAntiSlopWordChar(ch));
+            const body = rangesToClassBody(excludedWord) + rangesToClassBody(codeRanges(codesOf(excludedExplicit)));
+            parts.push(make(body ? `[^${body}]` : '(?:.|\\n)', { atom: true }));
+            if (!set.has(OTHER_WORD)) {
+                const wordIn = explicitIn.filter(isAntiSlopWordChar);
+                if (wordIn.length) parts.push(make(`[${rangesToClassBody(codeRanges(codesOf(wordIn)))}]`, { atom: true }));
+            }
+        } else {
+            let ranges = [];
+            if (set.has(OTHER_WORD)) ranges = subtractCodes(ANTI_SLOP_WORD_RANGES, codesOf(explicitOut));
+            const extra = set.has(OTHER_WORD) ? explicitIn.filter(ch => !isAntiSlopWordChar(ch)) : explicitIn;
+            ranges = ranges.concat(codeRanges(codesOf(extra)));
+            if (ranges.length === 1 && ranges[0][0] === ranges[0][1]) {
+                parts.push(make(String.fromCharCode(ranges[0][0]).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), { atom: true }));
+            } else if (ranges.length) {
+                parts.push(make(`[${rangesToClassBody(ranges)}]`, { atom: true }));
             }
         }
+        return parts.reduce((acc, p) => union(acc, p), null);
+    };
 
-        const safeClass = `[^${excludes.join('')}]`;
-        const parts = [safeClass, ...branches];
-        return `(${parts.join('|')})`;
+    // --- Generalised NFA: R is split into an entry and an exit node ---------------------------
+    const ROOT_OUT = 'ro';
+    const ROOT_IN = 'ri';
+    const END = 'end';
+    const START = 'start';
+    const edges = new Map();
+    let tooLarge = false;
+    const addEdge = (from, to, regex) => {
+        if (regex === null) return;
+        if (!edges.has(from)) edges.set(from, new Map());
+        const row = edges.get(from);
+        const merged = row.has(to) ? union(row.get(to), regex) : regex;
+        if (merged.length > ANTI_SLOP_MAX_PATTERN_CHARS) tooLarge = true;
+        row.set(to, merged);
+    };
+    const edge = (from, to) => edges.get(from)?.get(to) ?? null;
+
+    // BFS distance of every state reachable from R or from the prefix state (drives elimination order).
+    const distance = new Map();
+    for (const origin of [ROOT, startState]) {
+        if (distance.has(origin)) continue;
+        distance.set(origin, origin === ROOT ? 0 : 1);
+        const bfs = [origin];
+        while (bfs.length) {
+            const s = bfs.shift();
+            for (const t of states[s].next.values()) {
+                if (t !== DEAD && !distance.has(t)) { distance.set(t, distance.get(s) + 1); bfs.push(t); }
+            }
+        }
     }
 
-    const expr = toRegex(root);
-    if (!expr) return null;
+    const nodeId = (s, asSource) => (s === ROOT ? (asSource ? ROOT_OUT : ROOT_IN) : s);
+    // "Inside an unbanned word" (M). Its boundary transitions are shared by most states, so they live on a
+    // separate node BOUNDARY that those states reach by an empty step: `(other letters)* boundary` then
+    // appears once per state instead of being spelled out twice.
+    const insideWord = stateIndex.get(stateKey([], true));
+    const BOUNDARY = 'boundary';
+    const nonwordSymbols = symbols.filter(sym => !symbolIsWord(sym));
+    const sharesBoundary = (s) => insideWord !== undefined && distance.has(insideWord)
+        && nonwordSymbols.every(sym => states[s].next.get(sym) === states[insideWord].next.get(sym));
+    for (const s of distance.keys()) {
+        const viaBoundary = sharesBoundary(s);
+        const byTarget = new Map();
+        for (const [sym, t] of states[s].next) {
+            if (t === DEAD) continue;
+            if (viaBoundary && !symbolIsWord(sym)) continue;
+            if (!byTarget.has(t)) byTarget.set(t, []);
+            byTarget.get(t).push(sym);
+        }
+        for (const [t, syms] of byTarget) addEdge(nodeId(s, true), nodeId(t, false), labelFor(syms));
+        if (viaBoundary) addEdge(nodeId(s, true), BOUNDARY, '');
+        if (s !== ROOT && s !== insideWord) addEdge(s, END, '');
+    }
+    if (insideWord !== undefined && distance.has(insideWord)) {
+        const byTarget = new Map();
+        for (const sym of nonwordSymbols) {
+            const t = states[insideWord].next.get(sym);
+            if (t === DEAD) continue;
+            if (!byTarget.has(t)) byTarget.set(t, []);
+            byTarget.get(t).push(sym);
+        }
+        for (const [t, syms] of byTarget) addEdge(BOUNDARY, nodeId(t, false), labelFor(syms));
+        addEdge(BOUNDARY, END, '');
+    }
+    if (startState !== ROOT) addEdge(START, startState, '');
+
+    // Elimination order: the inside-word state first, then states farthest from R, and the shared boundary
+    // last, so each trie path ends up nested under its shared prefix and boundary handling appears once.
+    const order = [];
+    if (insideWord !== undefined && distance.has(insideWord)) order.push(insideWord);
+    for (const st of [...distance.keys()].sort((a, b) => distance.get(b) - distance.get(a))) {
+        if (st !== ROOT && st !== insideWord) order.push(st);
+    }
+    if (edges.has(BOUNDARY)) order.push(BOUNDARY);
+    for (const k of order) {
+        if (tooLarge) break;
+        const loop = star(edge(k, k));
+        const outgoing = [...(edges.get(k) ?? new Map()).keys()].filter(to => to !== k);
+        for (const [from, row] of edges) {
+            if (from === k || !row.has(k)) continue;
+            const inRegex = row.get(k);
+            row.delete(k);
+            for (const to of outgoing) addEdge(from, to, concat(inRegex, loop, edge(k, to)));
+        }
+        edges.delete(k);
+    }
+    if (tooLarge) return { pattern: null, error: 'The ban list is too large for a schema pattern; remove some entries.' };
+
+    const cycle = edge(ROOT_OUT, ROOT_IN);
+    const tail = union('', edge(ROOT_OUT, END));
+    const start = startState === ROOT ? '' : edge(START, ROOT_IN);
+    if (cycle === null) return { pattern: null, error: 'The ban list blocks every possible reply.' };
+    if (start === null) return { pattern: null, error: 'Could not continue safely from the prefill.' };
+
+    const patternMode = String(opts.patternMode ?? 'default');
+    // One cycle is roughly a word plus its separator, so convert the character minimum to cycles
+    // (rounded down, so a tiny minimum such as Continue's 1 doesn't demand a word boundary).
+    const minCycles = Math.max(0, Math.floor(Math.trunc(Number(opts.minChars) || 0) / 6));
+    let repeated;
+    if (patternMode === 'anthropic' || minCycles === 0) {
+        // Anthropic rejects large `{n,}` ranges; just require some output.
+        repeated = start || minCycles === 0 ? star(cycle) : `${group(cycle)}+`;
+    } else {
+        repeated = `${group(cycle)}{${minCycles},}`;
+    }
+    const startPart = hasAlt(start) ? group(start) : start;
+    const tailPart = hasAlt(tail) ? group(tail) : tail;
+    let pattern = `${startPart}${repeated}${tailPart}`;
+    if (pattern.length > ANTI_SLOP_TAIL_BUDGET_CHARS && minCycles > 0) {
+        pattern = `${startPart}${repeated}`;
+    }
+    // Without a minimum, a reply may also end before ever reaching a word boundary.
+    const startEnd = startState === ROOT ? null : edge(START, END);
+    if (startEnd !== null && (patternMode === 'anthropic' || minCycles === 0)) {
+        pattern = `(?:${pattern}|${startEnd})`;
+    }
+    if (pattern.length > ANTI_SLOP_MAX_PATTERN_CHARS) {
+        return { pattern: null, error: `The ban list needs a ${pattern.length}-character pattern (limit ${ANTI_SLOP_MAX_PATTERN_CHARS}); remove some entries, especially multi-word phrases.` };
+    }
 
     try {
-        new RegExp(expr);
-    } catch {
-        console.warn(`[${extensionName}] Anti-slop pattern failed validation, skipping.`);
-        return null;
+        new RegExp(pattern);
+    } catch (err) {
+        return { pattern: null, error: `Anti-slop pattern failed validation: ${err?.message ?? err}` };
     }
-    return expr;
+    return { pattern, error: '' };
 }
+// </anti-slop>
 
 function splitHintSuffix(placeholderBody) {
     const body = String(placeholderBody ?? '');
@@ -2080,6 +2272,24 @@ function buildPrefixRegexFromWireTemplate(wireTemplate) {
     return out;
 }
 
+// Text after the last `[[...]]` slot: the part of the prefix whose exact characters are known.
+function getLiteralTailAfterSlots(prefix) {
+    const text = normalizeNewlines(prefix);
+    const slotRe = /\[\[[^\]]+?\]\]/g;
+    let tailStart = 0;
+    let m;
+    while ((m = slotRe.exec(text)) !== null) tailStart = m.index + m[0].length;
+    return text.slice(tailStart);
+}
+
+let lastAntiSlopWarning = '';
+function warnAntiSlopOnce(message) {
+    console.warn(`[${extensionName}] Anti-slop disabled for this request: ${message}`);
+    if (message === lastAntiSlopWarning) return;
+    lastAntiSlopWarning = message;
+    toastr.warning(`Anti-slop is off for this reply: ${message}`, extensionName, { timeOut: 9000, closeButton: true });
+}
+
 function buildJsonSchemaForPrefillValuePattern(prefix, minCharsAfterPrefix, joinSuffixRegex = '', opts = {}) {
     const mustEndAfterTemplate = !!opts?.mustEndAfterTemplate;
     const minChars = mustEndAfterTemplate ? 0 : clampInt(minCharsAfterPrefix, 1, 10000, 1);
@@ -2090,8 +2300,8 @@ function buildJsonSchemaForPrefillValuePattern(prefix, minCharsAfterPrefix, join
     // We encode any prefill newlines as a token (e.g. "<NL>") and later decode for display.
     // Enforce:
     // - starts with wirePrefix
-    // - continuation (after prefix) has at least `minChars` characters
-    // - continuation contains at least one non-whitespace character (prevents whitespace padding)
+    // - continuation (after prefix) has at least `minChars` characters (or ends right after the template for [[end]])
+    // - continuation never contains an anti-slop entry
     let prefixRegex = buildPrefixRegexFromWireTemplate(wirePrefix);
 
     // Robust newline handling:
@@ -2111,67 +2321,67 @@ function buildJsonSchemaForPrefillValuePattern(prefix, minCharsAfterPrefix, join
         prefixRegex = escapeRegexSourceForAsciiPattern(prefixRegex);
     }
 
+    // Anti-slop: the continuation must never spell a banned entry, including across the prefix boundary.
+    let antiSlopExpr = null;
+    if (!mustEndAfterTemplate) {
+        const antiSlop = buildAntiSlopContinuation(extension_settings[extensionName]?.anti_slop_ban_list, {
+            minChars,
+            patternMode: runtimeState.patternMode,
+            prefixText: getLiteralTailAfterSlots(prefix),
+        });
+        if (antiSlop.error) warnAntiSlopOnce(antiSlop.error);
+        antiSlopExpr = antiSlop.pattern;
+        if (antiSlopExpr && runtimeState.patternMode === 'anthropic') {
+            antiSlopExpr = escapeRegexSourceForAsciiPattern(antiSlopExpr);
+        }
+    }
+
     // Append raw join-suffix regex (e.g. `[^A-Z]`) for Continue flows.
     // This is injected directly (not via [[re:...]] slot syntax) to avoid slot-parser issues
-    // with `]` inside character classes.
-    if (joinSuffixRegex) {
+    // with `]` inside character classes. Skipped with anti-slop: the anti-slop automaton must see
+    // every character after the prefix, or a banned word could be split around the joined char.
+    if (joinSuffixRegex && !antiSlopExpr) {
         prefixRegex += joinSuffixRegex;
     }
 
     // Avoid lookaheads for broader provider compatibility.
-    //
-    // Provider differences:
-    // - OpenAI-style schema regex generally supports `{n,m}` quantifiers.
-    // - Anthropic (often via OpenRouter translation) rejects some patterns, including certain range quantifiers.
-    //
-    // So we use a conservative mode for Anthropic: require at least one character after prefix,
-    // but do not enforce `min_chars_after_prefix` with a `{n,}` range.
-    // Use `${anyChar}+` for simplicity; the stream guard already protects against pathological padding.
-    const minMinusOne = Math.max(0, minChars - 1);
-    const defaultAnyChar = anyCharIncludingNewlineExpr();
-    const antiSlopExpr = buildAntiSlopContinuation(extension_settings[extensionName]?.anti_slop_ban_list);
-    const anyChar = antiSlopExpr || defaultAnyChar;
-    let pattern = '';
-    if (mustEndAfterTemplate) {
-        // Allow a small amount of trailing whitespace/newlines for robustness (models sometimes emit a final newline).
-        // IMPORTANT: avoid `\s` for Anthropic compatibility; keep ASCII.
-        let trailing = `[\\t \\r\\n]*`;
-        if (newlineToken) {
+    // Anthropic rejects large `{n,}` ranges, so there we only require at least one character after the prefix.
+    const anyChar = anyCharIncludingNewlineExpr();
+    const buildPattern = (prefixSource) => {
+        if (mustEndAfterTemplate) {
+            // Allow a small amount of trailing whitespace/newlines for robustness (models sometimes emit a final newline).
+            // IMPORTANT: avoid `\s` for Anthropic compatibility; keep ASCII.
+            let trailing = `[\\t \\r\\n]*`;
             // Some providers emit the newline token literally instead of real `\n`.
             // Anthropic rejects non-ASCII patterns, so only include literal token if ASCII.
-            const tokenIsAscii = /^[\x00-\x7F]*$/.test(String(newlineToken));
-            if (tokenIsAscii) {
+            if (newlineToken && /^[\x00-\x7F]*$/.test(String(newlineToken))) {
                 const escapedToken = escapeRegExp(newlineToken);
                 trailing = `[\\t ]*(?:${escapedToken}|\\n)?(?:[\\t ]*(?:${escapedToken}|\\n)[\\t ]*)*`;
             }
+            return `^(?:${prefixSource})${trailing}$`;
         }
-        pattern = `^(?:${prefixRegex})${trailing}$`;
-    } else if (runtimeState.patternMode === 'anthropic') {
-        pattern = `^(?:${prefixRegex})${anyChar}+$`;
-    } else {
-        // Avoid `\S` / `[\s\S]` because some providers reject `\S` in schema patterns.
-        //
-        // IMPORTANT:
-        // Do NOT force a non-whitespace character at a specific position after the prefix.
-        // That can deadlock on "newline-y" continuations (e.g. the model wants to start a new paragraph
-        // right after the minimum length, but the regex requires a non-whitespace there).
-        // Length-only is enough; the stream guard already protects against pathological padding loops.
-        pattern = `^(?:${prefixRegex})${anyChar}{${minChars},}$`;
-    }
+        if (antiSlopExpr) return `^(?:${prefixSource})${antiSlopExpr}$`;
+        // Do NOT force a non-whitespace character at a specific position after the prefix: that can deadlock
+        // on "newline-y" continuations. Length-only is enough; the stream guard catches padding loops.
+        if (runtimeState.patternMode === 'anthropic') return `^(?:${prefixSource})${anyChar}+$`;
+        return `^(?:${prefixSource})${anyChar}{${minChars},}$`;
+    };
 
-    // Best-effort local validation so a bad directive regex doesn't brick generation.
+    let pattern = buildPattern(prefixRegex);
+    // Best-effort local validation so a bad [[re:...]] slot doesn't brick generation:
+    // fall back to enforcing the prefill text literally (slots included as plain text).
     try {
         // eslint-disable-next-line no-new
         new RegExp(pattern);
     } catch (err) {
-        console.warn(`[${extensionName}] Invalid injected regex pattern; falling back to a minimal-safe pattern.`, err);
-        if (mustEndAfterTemplate) {
-            pattern = `^(?:${prefixRegex})[\\t \\r\\n]*$`;
-        } else {
-            pattern = runtimeState.patternMode === 'anthropic'
-                ? `^(?:${prefixRegex})${anyChar}+$`
-                : `^(?:${prefixRegex})${anyChar}{${minChars},}$`;
+        console.warn(`[${extensionName}] Invalid injected regex pattern; enforcing the prefill literally instead.`, err);
+        let literal = escapePrefixLiteral(wirePrefix);
+        if (newlineToken) {
+            const escapedToken = escapeRegExp(newlineToken);
+            literal = literal.split(escapedToken).join(`(?:${escapedToken}|\\n)`);
         }
+        if (runtimeState.patternMode === 'anthropic') literal = escapeRegexSourceForAsciiPattern(literal);
+        pattern = buildPattern(literal);
     }
 
     return {
@@ -2407,79 +2617,25 @@ function tryUnwrapStructuredOutput(text) {
         return base + s;
     };
 
+    const finish = (value) => {
+        const decoded = decode(value);
+        return runtimeState.continue.active ? applyContinueJoin(decoded) : decoded;
+    };
+
     try {
         const parsed = JSON.parse(text);
-        if (parsed && typeof parsed === 'object') {
-            if (typeof parsed.response === 'string') {
-                const decoded = decode(parsed.response);
-                return runtimeState.continue.active ? applyContinueJoin(decoded) : decoded;
-            }
-            if (typeof parsed.value === 'string') {
-                // Back-compat with older schema.
-                const decoded = decode(parsed.value);
-                return runtimeState.continue.active ? applyContinueJoin(decoded) : decoded;
-            }
-            if (typeof parsed.prefix === 'string' || typeof parsed.content === 'string') {
-                const prefix = typeof parsed.prefix === 'string' ? decode(parsed.prefix) : '';
-                const content = typeof parsed.content === 'string' ? decode(parsed.content) : '';
-                const joined = prefix + content;
-                if (joined.length === 0) return '';
-                return runtimeState.continue.active ? applyContinueJoin(joined) : joined;
-            }
-            // Back-compat with the previous multi-field attempt.
-            if (typeof parsed.content === 'string') return String(runtimeState.expectedPrefill ?? '') + decode(parsed.content);
-        }
+        if (typeof parsed?.response === 'string') return finish(parsed.response);
     } catch {
         // JSON.parse failed. Some providers/models still *mostly* follow the schema but emit invalid JSON,
         // commonly due to unescaped quotes inside the structured string field (causing early termination).
-        //
-        // Use a tolerant extractor first; fall back to strict extraction only if needed.
+        // Use a tolerant extractor first; fall back to strict (partial) extraction below.
         const looseResponse = tryExtractJsonStringFieldLoose(text, 'response');
-        if (typeof looseResponse === 'string') {
-            const decoded = decode(looseResponse);
-            return runtimeState.continue.active ? applyContinueJoin(decoded) : decoded;
-        }
-        const looseValue = tryExtractJsonStringFieldLoose(text, 'value');
-        if (typeof looseValue === 'string') {
-            const decoded = decode(looseValue);
-            return runtimeState.continue.active ? applyContinueJoin(decoded) : decoded;
-        }
-        const loosePrefix = tryExtractJsonStringFieldLoose(text, 'prefix');
-        const looseContent = tryExtractJsonStringFieldLoose(text, 'content');
-        if (typeof loosePrefix === 'string' || typeof looseContent === 'string') {
-            const joined = decode(loosePrefix ?? '') + decode(looseContent ?? '');
-            if (joined.length === 0) return '';
-            return runtimeState.continue.active ? applyContinueJoin(joined) : joined;
-        }
-
-        // Fall back to partial extraction (useful during early streaming).
+        if (typeof looseResponse === 'string') return finish(looseResponse);
     }
 
+    // Partial extraction (useful during early streaming).
     const response = tryExtractJsonStringField(text, 'response');
-    if (typeof response === 'string') {
-        const decoded = decode(response);
-        return runtimeState.continue.active ? applyContinueJoin(decoded) : decoded;
-    }
-
-    // Back-compat: single-field schema.
-    const legacy = tryExtractJsonStringField(text, 'value');
-    if (typeof legacy === 'string') {
-        const decoded = decode(legacy);
-        return runtimeState.continue.active ? applyContinueJoin(decoded) : decoded;
-    }
-
-    const prefix = tryExtractJsonStringField(text, 'prefix');
-    const content2 = tryExtractJsonStringField(text, 'content');
-    if (typeof prefix === 'string' || typeof content2 === 'string') {
-        const joined = decode(prefix ?? '') + decode(content2 ?? '');
-        if (joined.length === 0) return '';
-        return runtimeState.continue.active ? applyContinueJoin(joined) : joined;
-    }
-
-    // Back-compat with the previous multi-field attempt.
-    const content = tryExtractJsonStringField(text, 'content');
-    if (typeof content === 'string') return String(runtimeState.expectedPrefill ?? '') + decode(content);
-    return null;
+    return typeof response === 'string' ? finish(response) : null;
 }
 
 function applyTextToMessage(messageId, newText, { forceRerender = false } = {}) {
@@ -2518,16 +2674,11 @@ function applyTextToMessage(messageId, newText, { forceRerender = false } = {}) 
     const displayText = computeDisplayText(messageId, textAfterRegex);
 
     message.extra ??= {};
-    // Persist the prefix template so edits can re-apply hide-prefill consistently.
-    if (!runtimeState.continue.active) {
-        const expected = String(runtimeState.expectedPrefill ?? '');
-        if (expected) storePrefillMetadataForMessage(messageId, expected);
-    }
 
     // When hide-prefill is active and the display text differs from the full text,
     // store the *stripped* version in message.mes so the prefill doesn't enter the AI's
-    // context on subsequent generations.  The full text is recoverable from
-    // message.extra.structuredprefill.prefixTemplate if ever needed.
+    // context on subsequent generations. This happens once, when the reply is applied; later user
+    // edits are left alone so text that merely starts like the prefill is never deleted.
     const settings = extension_settings[extensionName];
     const prefillWasStripped = settings?.hide_prefill_in_display && displayText !== textAfterRegex;
     // If an early-aborted response only contains the prefix, stripping would make it look like the message vanished.
@@ -2637,10 +2788,6 @@ function applyTextToMessageStreaming(messageId, newText) {
     // Keep the backing data decoded even during streaming so edit/cancel doesn't resurrect raw JSON.
     message.mes = newText;
     message.extra ??= {};
-    if (!runtimeState.continue.active) {
-        const expected = String(runtimeState.expectedPrefill ?? '');
-        if (expected) storePrefillMetadataForMessage(messageId, expected);
-    }
     if (displayText !== newText) {
         message.extra.display_text = displayText;
     } else if (Object.prototype.hasOwnProperty.call(message.extra, 'display_text')) {
@@ -2731,23 +2878,10 @@ function clearStopCleanupTimer() {
 
 function getRawCandidateForMessage(messageId) {
     const mes = chat?.[messageId]?.mes;
-    if (typeof mes === 'string' && (mes.includes('"response"') || mes.includes('"value"'))) return mes;
+    if (typeof mes === 'string' && mes.includes('"response"')) return mes;
     const latest = String(runtimeState.latestStreamText ?? '');
     if (latest.trimStart().startsWith('{')) return latest;
     return mes || latest || '';
-}
-
-function forceUnwrapMessage(messageId) {
-    if (typeof messageId !== 'number' || messageId < 0 || messageId >= chat.length) return false;
-
-    const raw = getRawCandidateForMessage(messageId);
-    const unwrapped = tryUnwrapStructuredOutput(String(raw));
-    if (typeof unwrapped !== 'string') return false;
-    if (unwrapped === runtimeState.lastAppliedText) return true;
-
-    runtimeState.lastAppliedText = unwrapped;
-    applyTextToMessage(messageId, unwrapped, { forceRerender: true });
-    return true;
 }
 
 function scheduleDecodedRender(messageId) {
@@ -2880,14 +3014,38 @@ function touchStopCleanup(messageId, sessionAtStop) {
 async function onChatCompletionSettingsReady(generateData) {
     const settings = extension_settings[extensionName];
     if (!settings?.enabled) return;
-    if (!generateData || typeof generateData !== 'object') return;
+    if (!generateData || typeof generateData !== 'object' || !Array.isArray(generateData.messages)) return;
 
     clearPostStopDomFixTimer();
 
-    if (!supportsStructuredPrefillForSource(generateData.chat_completion_source)) return;
-    if (generateData.json_schema) return;
+    // Any edits to the request (removed prefill, pushed override, relabelled roles) are rolled back
+    // unless a schema actually gets injected, so a bail-out never leaves a half-modified request.
+    const originalMessages = generateData.messages.map(m => ({ ...m }));
+    const hadAssistantPrefill = Object.prototype.hasOwnProperty.call(generateData, 'assistant_prefill');
+    const originalAssistantPrefill = generateData.assistant_prefill;
+    let injected = false;
+    try {
+        injected = await injectStructuredPrefill(generateData, settings);
+    } catch (err) {
+        console.error(`[${extensionName}] Failed to apply structured prefill; sending the request unchanged.`, err);
+    }
+    if (!injected) {
+        generateData.messages.length = 0;
+        generateData.messages.push(...originalMessages);
+        if (hadAssistantPrefill) generateData.assistant_prefill = originalAssistantPrefill;
+    }
+}
+
+/**
+ * Rewrites `generateData` to enforce the prefill through `json_schema`.
+ * @returns {Promise<boolean>} true when a schema was injected.
+ */
+async function injectStructuredPrefill(generateData, settings) {
+    const support = getStructuredOutputSupport(generateData);
+    if (!support.supported) return false;
+    if (generateData.json_schema) return false;
     // Avoid conflicts with tool-calling in early testing; can be revisited later.
-    if (Array.isArray(generateData.tools) && generateData.tools.length > 0) return;
+    if (Array.isArray(generateData.tools) && generateData.tools.length > 0) return false;
 
     const requestType = String(generateData.type ?? '').toLowerCase();
 
@@ -2895,12 +3053,12 @@ async function onChatCompletionSettingsReady(generateData) {
     // the input textarea or return text silently. Injecting structured output would break them:
     // the model returns `{"response":"..."}` JSON that ST can't use, and the stream observer would
     // incorrectly overwrite the last assistant message.
-    if (requestType === 'impersonate' || requestType === 'quiet') return;
+    if (requestType === 'impersonate' || requestType === 'quiet') return false;
 
     const isContinue = requestType === 'continue';
 
     const messages = generateData.messages;
-    if (!Array.isArray(messages) || messages.length === 0) return;
+    if (!Array.isArray(messages) || messages.length === 0) return false;
 
     const src = String(generateData.chat_completion_source ?? '').toLowerCase();
     const modelId = String(generateData.model ?? '');
@@ -2935,32 +3093,43 @@ async function onChatCompletionSettingsReady(generateData) {
     while (tailIndex >= 0 && messages[tailIndex]?.role === 'system') tailIndex--;
     let tail = tailIndex >= 0 ? messages[tailIndex] : null;
 
-    if (!isContinue && overridePrefillText) {
-        if (tail?.role === 'assistant') {
-            tail.content = overridePrefillText;
+    // In group chats (or when generating with an empty input after an AI reply), the trailing assistant
+    // message is real chat history, not a prefill. Never turn it into an enforced prefix.
+    const tailIsChatHistory = !isContinue && requestType !== 'swipe' && tail?.role === 'assistant' && isTailLastChatMessage(tail.content);
+
+    // Claude-style sources send "Start Claude's answer with" as `assistant_prefill` instead of a message.
+    // Enforce it like a Prompt Manager prefill and drop the field (models that reject prefill would fail on it).
+    const assistantPrefillField = typeof generateData.assistant_prefill === 'string' ? generateData.assistant_prefill : '';
+    if (assistantPrefillField) delete generateData.assistant_prefill;
+
+    const historyTail = tailIsChatHistory ? tail : null;
+    const hasPromptPrefill = tail?.role === 'assistant' && !tailIsChatHistory;
+    const replacementPrefill = isContinue ? '' : (overridePrefillText || (hasPromptPrefill ? '' : assistantPrefillField));
+    if (replacementPrefill) {
+        if (hasPromptPrefill) {
+            tail.content = replacementPrefill;
         } else {
-            tail = { role: 'assistant', content: overridePrefillText };
+            tail = { role: 'assistant', content: replacementPrefill };
             messages.push(tail);
             tailIndex = messages.length - 1;
         }
+    } else if (tailIsChatHistory) {
+        return false;
     }
 
-    if (!tail || tail.role !== 'assistant' || typeof tail.content !== 'string') return;
+    if (!tail || tail.role !== 'assistant' || typeof tail.content !== 'string') return false;
     let tailContent = tail.content;
-    if (!tailContent) return;
+    if (!tailContent) return false;
 
     // When ST's "Character Names Behavior" is set to "Message Content", all message contents
     // in the messages array get "CharName: " prepended (openai.js setOpenAIMessages).
     // Strip it: baseText (from chat[].mes) never has the prefix, so leaving it causes mismatches
     // in Continue logic and leaks the name into the schema pattern.
     {
-        const names = (runtimeState.knownNames ?? []).slice().sort((a, b) => b.length - a.length);
-        for (const name of names) {
-            if (name && tailContent.startsWith(name + ': ')) {
-                tailContent = tailContent.slice(name.length + 2);
-                tail.content = tailContent;
-                break;
-            }
+        const stripped = stripKnownNamePrefix(tailContent);
+        if (stripped !== tailContent) {
+            tailContent = stripped;
+            tail.content = tailContent;
         }
     }
 
@@ -3014,7 +3183,7 @@ async function onChatCompletionSettingsReady(generateData) {
             const { baseFound } = splitContinuePmPrefixFromTail(prefillTemplate, baseText);
             if (!looksLikeBase && !baseFound) {
                 clearContinueState();
-                return;
+                return false;
             }
         }
 
@@ -3052,7 +3221,6 @@ async function onChatCompletionSettingsReady(generateData) {
 
         const overlapChars = clampInt(settings.continue_overlap_chars, 0, 120, 14);
         const overlap = computeContinueOverlapBase(baseText, overlapChars);
-        runtimeState.continue.overlapText = overlap;
         buildContinueOverlapStripper(overlap);
         joinSuffixRegex = buildContinueJoinPlaceholder(baseText);
 
@@ -3072,7 +3240,7 @@ async function onChatCompletionSettingsReady(generateData) {
         // If disabled (or if generation fails), replace `[[pg]]` with an empty string and proceed normally.
         if (templateHasPrefillGenSlot(prefillTemplate)) {
             const profileId = String(settings.prefill_gen_profile_id ?? '');
-            const maxTokens = clampInt(settings.prefill_gen_max_tokens, 1, 29999999999999048, 15);
+            const maxTokens = clampInt(settings.prefill_gen_max_tokens, 1, 2048, 15);
             const timeoutMs = clampInt(settings.prefill_gen_timeout_ms, 500, 120000, 120000);
             const stopStrings = parseStopStrings(settings.prefill_gen_stop);
             const extraPrompt = String(settings.prefill_gen_extra_prompt ?? '');
@@ -3159,10 +3327,11 @@ async function onChatCompletionSettingsReady(generateData) {
 
         const lastMsg = messages[messages.length - 1];
 
-        // Non-Continue: if we end on assistant, this is assistant-prefill and many providers reject it with output formats.
-        if (!isContinue && lastMsg?.role === 'assistant') return;
+        // Non-Continue: if we still end on assistant, it is another prefill (many providers reject that with
+        // output formats). Ending on the previous AI reply is fine: that is plain chat history (group chats).
+        if (!isContinue && lastMsg?.role === 'assistant' && !(tailIsChatHistory && lastMsg === historyTail)) return false;
 
-        if (runtimeState.patternMode === 'anthropic' && lastMsg?.role !== 'user' && lastMsg?.role !== 'system') return;
+        if (runtimeState.patternMode === 'anthropic' && lastMsg?.role !== 'user' && lastMsg?.role !== 'system') return false;
     }
 
     const minCharsSetting = clampInt(settings.min_chars_after_prefix, 1, 10000, 80);
@@ -3190,9 +3359,6 @@ async function onChatCompletionSettingsReady(generateData) {
     runtimeState.stopSessionAt = 0;
     clearStopCleanupTimer();
     runtimeState.lastInjectedAt = Date.now();
-    // Store the straight-quoted version: curly quotes only exist for JSON wire robustness,
-    // but the decoded output is always straightened, so metadata/stripping must match straight quotes.
-    runtimeState.expectedPrefill = straightenCurlyQuotes(String(schemaPrefix ?? ''));
 
     // If this generation updates an existing assistant message (e.g., swipes), seed the fallback with the
     // currently displayed content so early-abort / early-token cases don't blank the message.
@@ -3209,6 +3375,8 @@ async function onChatCompletionSettingsReady(generateData) {
     } catch {
         // ignore
     }
+
+    return true;
 }
 
 function scheduleStreamUnwrap(rawText) {
@@ -3275,6 +3443,40 @@ function onGenerationStopped() {
     touchStopCleanup(messageId, runtimeState.stopSessionAt);
 }
 
+// One-line answer to "is StructuredPrefill doing anything right now, and with which prefill?"
+function renderStatus() {
+    const el = document.getElementById('structuredprefill_status');
+    if (!(el instanceof HTMLElement)) return;
+
+    const settings = extension_settings[extensionName];
+    const setStatus = (active, text) => {
+        el.textContent = text;
+        el.classList.toggle('active', active);
+        el.classList.toggle('inactive', !active);
+    };
+
+    if (!settings?.enabled) return setStatus(false, 'Off.');
+
+    const mainApi = String(stScript?.main_api ?? '');
+    const oai = stOpenAi?.oai_settings;
+    if ((mainApi && mainApi !== 'openai') || !oai) {
+        return setStatus(false, 'Inactive: switch to a Chat Completion API.');
+    }
+
+    const model = typeof stOpenAi.getChatCompletionModel === 'function' ? String(stOpenAi.getChatCompletionModel(oai) ?? '') : '';
+    const support = getStructuredOutputSupport({
+        chat_completion_source: oai.chat_completion_source,
+        model,
+        pollinations_endpoint: oai.pollinations_endpoint,
+    });
+    if (!support.supported) return setStatus(false, `Inactive: ${support.reason}`);
+
+    const prefillSource = getOverridePrefillText(settings)
+        ? "this preset's prefill"
+        : "the chat preset's prefill (a trailing assistant prompt), if it has one";
+    setStatus(true, `Active for ${oai.chat_completion_source}${model ? ` / ${model}` : ''}, using ${prefillSource}.`);
+}
+
 function renderSettingsToUi() {
     const settings = extension_settings[extensionName];
     refreshPresetList();
@@ -3294,6 +3496,7 @@ function renderSettingsToUi() {
     $('#structuredprefill_newline_token').val(String(settings.newline_token ?? '<NL>'));
     $('#structuredprefill_continue_overlap_chars').val(String(settings.continue_overlap_chars ?? 14));
     $('#structuredprefill_anti_slop_ban_list').val(String(settings.anti_slop_ban_list ?? ''));
+    renderStatus();
 }
 
 function setupUiListeners() {
@@ -3381,6 +3584,7 @@ function setupUiListeners() {
         .on('click', () => {
             extension_settings[extensionName].enabled = !!$('#structuredprefill_enabled').prop('checked');
             saveSettingsDebounced();
+            renderStatus();
         });
 
     $('#structuredprefill_hide_prefill_in_display')
@@ -3393,12 +3597,14 @@ function setupUiListeners() {
         .off('click')
         .on('click', () => {
             setPresetSetting('override_prefill_enabled', !!$('#structuredprefill_override_prefill_enabled').prop('checked'));
+            renderStatus();
         });
 
     $('#structuredprefill_override_prefill_text')
         .off('input')
         .on('input', () => {
             setPresetSetting('override_prefill_text', String($('#structuredprefill_override_prefill_text').val() ?? ''));
+            renderStatus();
         });
 
     $('#structuredprefill_min_chars_after_prefix')
@@ -3438,7 +3644,7 @@ function setupUiListeners() {
     $('#structuredprefill_prefill_gen_max_tokens')
         .off('change')
         .on('change', () => {
-            const value = clampInt($('#structuredprefill_prefill_gen_max_tokens').val(), 1, 20000048, 15);
+            const value = clampInt($('#structuredprefill_prefill_gen_max_tokens').val(), 1, 2048, 15);
             setPresetSetting('prefill_gen_max_tokens', value);
             $('#structuredprefill_prefill_gen_max_tokens').val(String(value));
         });
@@ -3500,8 +3706,10 @@ jQuery(async () => {
     eventSource.on(event_types.CONNECTION_PROFILE_CREATED, renderPrefillGenProfileSelect);
     eventSource.on(event_types.CONNECTION_PROFILE_UPDATED, renderPrefillGenProfileSelect);
     eventSource.on(event_types.CONNECTION_PROFILE_DELETED, renderPrefillGenProfileSelect);
+    for (const eventName of ['MAIN_API_CHANGED', 'CHATCOMPLETION_SOURCE_CHANGED', 'CHATCOMPLETION_MODEL_CHANGED', 'SETTINGS_LOADED_AFTER', 'OAI_PRESET_CHANGED_AFTER', 'CONNECTION_PROFILE_LOADED']) {
+        if (event_types[eventName]) eventSource.on(event_types[eventName], () => setTimeout(renderStatus, 0));
+    }
     eventSource.on(event_types.STREAM_TOKEN_RECEIVED, scheduleStreamUnwrap);
-    eventSource.on(event_types.MESSAGE_UPDATED, onMessageUpdated);
     eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
     eventSource.on(event_types.GENERATION_STOPPED, onGenerationStopped);
 

@@ -257,49 +257,9 @@ function insertExtraPromptMessages(messages, prompt, role) {
     return nextMessages;
 }
 
-function mergeAnthropicSystemPrompt(existing, prompt) {
-    const content = String(prompt ?? '');
-    if (!content.trim()) return existing;
-
-    if (typeof existing === 'string' && existing.trim()) {
-        return `${existing}\n${content}`;
-    }
-    if (Array.isArray(existing)) {
-        return [...existing, { type: 'text', text: content }];
-    }
-    if (existing && typeof existing === 'object' && typeof existing.text === 'string') {
-        return [{ ...existing }, { type: 'text', text: content }];
-    }
-    return content;
-}
-
-function appendGeminiSystemInstruction(existing, prompt) {
-    const content = String(prompt ?? '');
-    if (!content.trim()) return existing;
-
-    if (existing && typeof existing === 'object' && Array.isArray(existing.parts)) {
-        return {
-            ...existing,
-            parts: [...existing.parts, { text: content }],
-        };
-    }
-
-    return {
-        parts: [{ text: content }],
-    };
-}
-
 function shouldConvertFinalAssistantForTarget(targetUrl) {
     const hostname = String(targetUrl?.hostname ?? '').toLowerCase();
     return hostname.endsWith('openrouter.ai') || hostname.endsWith('anthropic.com');
-}
-
-function clearEmptyObjectField(object, key) {
-    const value = object?.[key];
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return;
-    if (Object.keys(value).length === 0) {
-        delete object[key];
-    }
 }
 
 function normalizeGenericRole(rawRole) {

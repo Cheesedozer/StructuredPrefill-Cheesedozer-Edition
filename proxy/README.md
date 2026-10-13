@@ -42,5 +42,5 @@ http://localhost:8382/https://generativelanguage.googleapis.com/v1beta/models/ge
 StructuredPrefill syntax:
 
 ```text
-https://rentry.org/structuredprefill
+See the main README: ../README.md (SLOTS / STUBS and ANTI-SLOP sections)
 ```

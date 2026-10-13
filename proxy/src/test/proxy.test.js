@@ -9,6 +9,7 @@ const assert = require('node:assert/strict');
 
 const {
     DEFAULT_PROXY_CONFIG,
+    buildAntiSlopContinuation,
     buildPatternResponseSchema,
     rewriteProxyJsonRequest,
     rewriteProxyJsonResponse,
@@ -87,23 +88,105 @@ test('anti-slop bans configured words from the continuation pattern', () => {
 
     const pattern = new RegExp(schema.properties.response.pattern);
     assert.equal(pattern.test('Hello puppy'), true);
+    assert.equal(pattern.test('Hello stargazer.'), true);
     assert.equal(pattern.test('Hello gaze'), false);
+    assert.equal(pattern.test('Hello GAZE.'), false);
+    assert.equal(pattern.test('Hello ggaze gazelle'), false);
     assert.equal(pattern.test('Hello smirked'), false);
 });
 
-test('anti-slop regex shape matches the extension for anthropic-safe simple bans', () => {
-    const schema = buildPatternResponseSchema('Hello ', {
+test('anti-slop blocks words split across the prefill boundary', () => {
+    const schema = buildPatternResponseSchema('She ga', {
         minCharsAfterPrefix: 1,
-        newlineToken: '\\n',
-        patternMode: 'anthropic',
+        newlineToken: '<NL>',
+        patternMode: 'default',
         knownNames: [],
-        antiSlopBanList: 'gaze',
+        antiSlopBanList: 'gaze\n—',
         mustEndAfterTemplate: false,
     });
 
+    const pattern = new RegExp(schema.properties.response.pattern);
+    assert.equal(pattern.test('She gaped.'), true);
+    assert.equal(pattern.test('She gaze.'), false);
+    assert.equal(pattern.test('She gasped — loudly.'), false);
+    assert.equal(pattern.test('She ga, then Gaze.'), false);
+    assert.equal(pattern.test('She ga, stargaze.'), true);
+});
+
+test('anti-slop anthropic patterns stay ASCII and avoid large range quantifiers', () => {
+    const schema = buildPatternResponseSchema('Hello ', {
+        minCharsAfterPrefix: 80,
+        newlineToken: '\\n',
+        patternMode: 'anthropic',
+        knownNames: [],
+        antiSlopBanList: 'gaze\n—',
+        mustEndAfterTemplate: false,
+    });
+
+    const source = schema.properties.response.pattern;
+    assert.match(source, /^[\x00-\x7F]*$/);
+    assert.doesNotMatch(source, /\{\d+,\}/);
+    const pattern = new RegExp(source);
+    assert.equal(pattern.test('Hello there.'), true);
+    assert.equal(pattern.test('Hello gazes.'), false);
+    assert.equal(pattern.test('Hello — there.'), false);
+});
+
+test('anti-slop pattern matches a brute-force reference on random text', () => {
+    const fold = (c) => (c.toLowerCase().length === 1 ? c.toLowerCase() : c);
+    const isWord = (c) => /[0-9A-Za-z]/.test(c);
+    const cases = [
+        { list: 'gaze\naza', prefix: '', alphabet: 'gaGAze xZ.' },
+        { list: 'abab\nbab\naa', prefix: 'ab', alphabet: 'ab .' },
+        { list: 'ozone\nelara\n—\n...', prefix: 'x ', alphabet: 'ozneElar—. ' },
+        { list: 'shiver down\nthe cat\nhe', prefix: 'She', alphabet: 'shiverdowntca .' },
+    ];
+    let seed = 12345;
+    const random = () => {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        return seed / 2147483648;
+    };
+
+    for (const { list, prefix, alphabet } of cases) {
+        const entries = list.split('\n').map(e => [...e].map(fold).join(''));
+        const { pattern, error } = buildAntiSlopContinuation(list, { minChars: 0, prefixText: prefix });
+        assert.equal(error, '');
+        const re = new RegExp(`^${pattern}$`);
+        for (let i = 0; i < 3000; i++) {
+            let text = '';
+            const len = Math.floor(random() * 14);
+            for (let j = 0; j < len; j++) text += alphabet[Math.floor(random() * alphabet.length)];
+            const full = [...(prefix + text)].map(fold).join('');
+            let expected = true;
+            for (const entry of entries) {
+                for (let at = full.indexOf(entry); at !== -1 && expected; at = full.indexOf(entry, at + 1)) {
+                    const startsWord = !isWord(entry[0]) || at === 0 || !isWord(full[at - 1]);
+                    if (startsWord && at + entry.length > prefix.length) expected = false;
+                }
+            }
+            assert.equal(re.test(text), expected, `${JSON.stringify(list)} + ${JSON.stringify(prefix + text)}`);
+        }
+    }
+});
+
+test('anti-slop reports oversized ban lists instead of emitting a huge pattern', () => {
+    const phrases = Array.from({ length: 60 }, (_, i) => `phrase number ${i} goes here`).join('\n');
+    const result = buildAntiSlopContinuation(phrases, { minChars: 80 });
+    assert.equal(result.pattern, null);
+    assert.match(result.error, /too large|limit/);
+});
+
+test('anti-slop code is identical in the extension and the proxy', () => {
+    const extract = (file) => {
+        const text = fs.readFileSync(file, 'utf8');
+        const start = text.indexOf('// <anti-slop>');
+        const end = text.indexOf('// </anti-slop>');
+        assert.ok(start !== -1 && end > start, `anti-slop markers missing in ${file}`);
+        return text.slice(start, end);
+    };
     assert.equal(
-        schema.properties.response.pattern,
-        '^(?:Hello )([^gG]|[Gg]([^aA]|[Aa]([^zZ]|[Zz]([^eE]))))+$',
+        extract(path.join(__dirname, '..', 'structured-prefill-core.js')),
+        extract(path.join(__dirname, '..', '..', '..', 'index.js')),
     );
 });
 
