@@ -3364,6 +3364,9 @@ async function injectStructuredPrefill(generateData, settings) {
     const minCharsSetting = clampInt(settings.min_chars_after_prefix, 1, 10000, 80);
     const minCharsAfterPrefix = isContinue ? 1 : (mustEndAfterTemplate ? 0 : minCharsSetting);
     generateData.json_schema = buildJsonSchemaForPrefillValuePattern(schemaPrefix, minCharsAfterPrefix, joinSuffixRegex, { mustEndAfterTemplate });
+    // Gemini's response_schema rejects `additionalProperties` (400 "Unknown name"), and relays such as
+    // LinkAPI pass the schema through unchanged. Gemini only emits declared properties anyway.
+    if (/gemini/i.test(modelId)) delete generateData.json_schema.value.additionalProperties;
 
     // Debug: log the structured output regex pattern that we inject.
     try {
