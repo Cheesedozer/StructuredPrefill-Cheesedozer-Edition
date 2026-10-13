@@ -490,70 +490,362 @@ function getPatternModeForRequest(provider, modelId, targetUrl) {
     return 'default';
 }
 
-function buildAntiSlopContinuation(banListStr) {
-    const raw = String(banListStr ?? '');
-    if (!raw.trim()) return null;
+// <anti-slop> Shared by index.js and proxy/src/structured-prefill-core.js; keep both copies identical (a proxy test checks).
+// ASCII letters and digits count as "inside a word" for anti-slop matching. Every other character is
+// treated as a word boundary, which can only block more, never less, and keeps the schema pattern small.
+const ANTI_SLOP_WORD_RANGES = [[0x30, 0x39], [0x41, 0x5A], [0x61, 0x7A]];
+const ANTI_SLOP_MAX_PATTERN_CHARS = 30000;
+// Above this size, drop the "reply may end mid-word" tail (it repeats the whole word tree) and
+// require replies to end on a non-word character instead (punctuation, space, newline, quote...).
+const ANTI_SLOP_TAIL_BUDGET_CHARS = 4000;
 
+function isAntiSlopWordChar(ch) {
+    const code = String(ch).charCodeAt(0);
+    return ANTI_SLOP_WORD_RANGES.some(([lo, hi]) => code >= lo && code <= hi);
+}
+
+/**
+ * Build the continuation regex (everything after the enforced prefix) for the anti-slop ban list.
+ *
+ * Matching rules (case-insensitive):
+ * - An entry that starts with a letter/digit is blocked wherever a word starts with it:
+ *   banning `gaze` blocks "gaze", "Gazed", "gazelle", but not "stargaze".
+ * - An entry that starts with anything else (`—`, `...`, `*`) is blocked everywhere.
+ * - Entries spanning the end of the prefix and the start of the reply are blocked too.
+ *
+ * The rules are compiled into a DFA, which is turned into a regex by state elimination around the
+ * "between words" state R:  continuation = START CYCLE{n,} TAIL
+ * - START: from the state the prefix leaves us in back to R (empty when the prefix ends in R),
+ * - CYCLE: one trip R -> ... -> R (roughly one word plus its trailing separator),
+ * - TAIL:  an optional unfinished trip, so the reply may end anywhere. Dropped for large lists (see
+ *          ANTI_SLOP_TAIL_BUDGET_CHARS), in which case the reply must end on a non-word character.
+ * `minChars` is approximate here: one CYCLE is counted as about six characters (rounded down).
+ *
+ * @param {string} banListStr Newline-separated banned words/phrases.
+ * @param {{ minChars?: number, patternMode?: string, prefixText?: string }} [opts]
+ * @returns {{ pattern: string|null, error: string }} `pattern` is null when there is nothing to ban or on error.
+ */
+function buildAntiSlopContinuation(banListStr, opts = {}) {
+    const entries = [];
     const seen = new Set();
-    const words = [];
-    for (const line of raw.split('\n')) {
+    for (const line of String(banListStr ?? '').split(/\r?\n/)) {
         const entry = line.trim();
-        if (!entry || seen.has(entry.toLowerCase())) continue;
-        seen.add(entry.toLowerCase());
-        words.push(entry);
-    }
-    if (words.length === 0) return null;
-
-    const mkNode = () => ({ ch: new Map(), end: false });
-    const root = mkNode();
-    for (const word of words) {
-        let node = root;
-        for (const ch of word) {
-            const key = ch.toLowerCase();
-            if (!node.ch.has(key)) node.ch.set(key, mkNode());
-            node = node.ch.get(key);
+        if (!entry) continue;
+        if (/[\uD800-\uDFFF]/.test(entry)) {
+            return { pattern: null, error: `"${entry}" contains characters (like emoji) that anti-slop cannot ban.` };
         }
-        node.end = true;
+        const key = [...entry].map(ch => foldChar(ch)).join('');
+        if (seen.has(key)) continue;
+        seen.add(key);
+        entries.push(key);
+    }
+    if (entries.length === 0) return { pattern: null, error: '' };
+
+    function foldChar(ch) {
+        const lower = ch.toLowerCase();
+        return lower.length === 1 ? lower : ch;
+    }
+    const variantsOf = (key) => {
+        const out = new Set([key]);
+        for (const v of [key.toLowerCase(), key.toUpperCase()]) {
+            if (v.length === 1 && foldChar(v) === key) out.add(v);
+        }
+        return [...out];
+    };
+
+    // --- Trie of entries ----------------------------------------------------------------------
+    const children = [new Map()];
+    const terminal = [false];
+    for (const entry of entries) {
+        let node = 0;
+        for (const ch of entry) {
+            let next = children[node].get(ch);
+            if (next === undefined) {
+                next = children.length;
+                children.push(new Map());
+                terminal.push(false);
+                children[node].set(ch, next);
+            }
+            node = next;
+        }
+        terminal[node] = true;
     }
 
-    const escapeClassChar = (ch) => (ch === ']' || ch === '\\' || ch === '^' || ch === '-') ? `\\${ch}` : ch;
+    // Input symbols: each explicit character (case-folded), plus "any other word char" / "any other char".
+    const alphabet = [...new Set(entries.flatMap(e => [...e]))].sort();
+    const OTHER_WORD = '\u0000word';
+    const OTHER_NONWORD = '\u0000nonword';
+    const symbols = [...alphabet, OTHER_WORD, OTHER_NONWORD];
+    const symbolIsWord = (sym) => (sym === OTHER_WORD ? true : sym === OTHER_NONWORD ? false : isAntiSlopWordChar(sym));
 
-    function toRegex(node) {
-        if (node.ch.size === 0) return null;
+    // --- DFA by subset construction ----------------------------------------------------------
+    // State = active partial matches (trie nodes) + whether the previous char was a word char.
+    const stateKey = (nodes, prevWord) => `${prevWord ? 'w' : 'n'}:${nodes.join(',')}`;
+    const states = [];
+    const stateIndex = new Map();
+    const DEAD = -1;
+    const addState = (nodes, prevWord) => {
+        const key = stateKey(nodes, prevWord);
+        if (!stateIndex.has(key)) {
+            stateIndex.set(key, states.length);
+            states.push({ nodes, prevWord, next: new Map() });
+        }
+        return stateIndex.get(key);
+    };
+    const step = (state, sym) => {
+        const nextNodes = new Set();
+        for (const node of state.nodes) {
+            const child = children[node].get(sym);
+            if (child !== undefined) nextNodes.add(child);
+        }
+        const isWord = symbolIsWord(sym);
+        const rootChild = children[0].get(sym);
+        // Letter-initial entries may only start at a word start; others may start anywhere.
+        if (rootChild !== undefined && (!isWord || !state.prevWord)) nextNodes.add(rootChild);
+        for (const node of nextNodes) if (terminal[node]) return DEAD;
+        return addState([...nextNodes].sort((a, b) => a - b), isWord);
+    };
 
-        const excludes = [];
-        const branches = [];
-        for (const [key, child] of node.ch) {
-            const lower = key.toLowerCase();
-            const upper = key.toUpperCase();
-            const hasCase = lower !== upper;
-            excludes.push(escapeClassChar(lower));
-            if (hasCase) excludes.push(escapeClassChar(upper));
+    let computed = 0;
+    const closeStates = () => {
+        for (; computed < states.length; computed++) {
+            for (const sym of symbols) states[computed].next.set(sym, step(states[computed], sym));
+            if (states.length > 5000) return false;
+        }
+        return true;
+    };
 
-            if (child.end) continue;
+    const ROOT = addState([], false);
+    if (!closeStates()) return { pattern: null, error: 'The ban list is too large to compile.' };
 
-            const charExpr = hasCase ? `[${upper}${lower}]` : escapeClassChar(key);
-            const sub = toRegex(child);
-            if (sub) {
-                branches.push(`${charExpr}${sub}`);
-            } else {
-                branches.push(charExpr);
+    // State the enforced prefix leaves us in, so entries can't be split across the boundary.
+    let startState = ROOT;
+    for (const raw of String(opts.prefixText ?? '')) {
+        const ch = foldChar(raw);
+        const sym = alphabet.includes(ch) ? ch : (isAntiSlopWordChar(raw) ? OTHER_WORD : OTHER_NONWORD);
+        const next = states[startState].next.get(sym);
+        // If the prefix itself contains a banned entry (it is user-written), just continue from a boundary.
+        startState = next === DEAD ? addState([], symbolIsWord(sym)) : next;
+        if (!closeStates()) return { pattern: null, error: 'The ban list is too large to compile.' };
+    }
+
+    // --- Regex helpers (null = matches nothing, '' = empty string) -------------------------
+    const info = new Map();
+    const make = (src, { atom = false, alt = false, opt = false } = {}) => {
+        if (!info.has(src)) info.set(src, { atom, alt, opt });
+        return src;
+    };
+    const isAtom = (r) => info.get(r)?.atom === true;
+    const hasAlt = (r) => info.get(r)?.alt === true;
+    const group = (r) => (isAtom(r) ? r : make(`(?:${r})`, { atom: true }));
+    const union = (a, b) => {
+        if (a === null) return b;
+        if (b === null || a === b) return a;
+        if (a === '' && b === '') return '';
+        if (a === '') return info.get(b)?.opt ? b : make(`${group(b)}?`, { opt: true });
+        if (b === '') return info.get(a)?.opt ? a : make(`${group(a)}?`, { opt: true });
+        return make(`${a}|${b}`, { alt: true });
+    };
+    const concat = (...parts) => {
+        if (parts.some(p => p === null)) return null;
+        const kept = parts.filter(p => p !== '');
+        if (kept.length === 0) return '';
+        if (kept.length === 1) return kept[0];
+        return make(kept.map(p => (hasAlt(p) ? group(p) : p)).join(''));
+    };
+    const star = (r) => (r === null || r === '' ? '' : make(`${group(r)}*`, { opt: true }));
+
+    const escClassChar = (code) => {
+        const ch = String.fromCharCode(code);
+        return /[\]\\^-]/.test(ch) ? `\\${ch}` : ch;
+    };
+    const rangesToClassBody = (ranges) => ranges
+        .map(([lo, hi]) => (lo === hi ? escClassChar(lo) : hi === lo + 1 ? `${escClassChar(lo)}${escClassChar(hi)}` : `${escClassChar(lo)}-${escClassChar(hi)}`))
+        .join('');
+    const subtractCodes = (ranges, codes) => {
+        let out = ranges.map(r => r.slice());
+        for (const code of [...codes].sort((a, b) => a - b)) {
+            const next = [];
+            for (const [lo, hi] of out) {
+                if (code < lo || code > hi) { next.push([lo, hi]); continue; }
+                if (lo <= code - 1) next.push([lo, code - 1]);
+                if (code + 1 <= hi) next.push([code + 1, hi]);
+            }
+            out = next;
+        }
+        return out;
+    };
+    const codesOf = (keys) => keys.flatMap(variantsOf).map(ch => ch.charCodeAt(0));
+    const codeRanges = (codes) => [...new Set(codes)].sort((a, b) => a - b).map(c => [c, c]);
+
+    // Regex for one edge label: a set of symbols that all lead to the same target state.
+    const labelFor = (syms) => {
+        const set = new Set(syms);
+        const explicitIn = alphabet.filter(ch => set.has(ch));
+        const explicitOut = alphabet.filter(ch => !set.has(ch));
+        const parts = [];
+        if (set.has(OTHER_NONWORD)) {
+            // Everything except: word chars not in this label, and explicit chars not in this label.
+            // Word chars outside the label are already covered by the word ranges when those are excluded.
+            const excludedWord = set.has(OTHER_WORD) ? [] : ANTI_SLOP_WORD_RANGES;
+            const excludedExplicit = set.has(OTHER_WORD) ? explicitOut : explicitOut.filter(ch => !isAntiSlopWordChar(ch));
+            const body = rangesToClassBody(excludedWord) + rangesToClassBody(codeRanges(codesOf(excludedExplicit)));
+            parts.push(make(body ? `[^${body}]` : '(?:.|\\n)', { atom: true }));
+            if (!set.has(OTHER_WORD)) {
+                const wordIn = explicitIn.filter(isAntiSlopWordChar);
+                if (wordIn.length) parts.push(make(`[${rangesToClassBody(codeRanges(codesOf(wordIn)))}]`, { atom: true }));
+            }
+        } else {
+            let ranges = [];
+            if (set.has(OTHER_WORD)) ranges = subtractCodes(ANTI_SLOP_WORD_RANGES, codesOf(explicitOut));
+            const extra = set.has(OTHER_WORD) ? explicitIn.filter(ch => !isAntiSlopWordChar(ch)) : explicitIn;
+            ranges = ranges.concat(codeRanges(codesOf(extra)));
+            if (ranges.length === 1 && ranges[0][0] === ranges[0][1]) {
+                parts.push(make(String.fromCharCode(ranges[0][0]).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), { atom: true }));
+            } else if (ranges.length) {
+                parts.push(make(`[${rangesToClassBody(ranges)}]`, { atom: true }));
             }
         }
+        return parts.reduce((acc, p) => union(acc, p), null);
+    };
 
-        return `([^${excludes.join('')}]${branches.length > 0 ? `|${branches.join('|')}` : ''})`;
+    // --- Generalised NFA: R is split into an entry and an exit node ---------------------------
+    const ROOT_OUT = 'ro';
+    const ROOT_IN = 'ri';
+    const END = 'end';
+    const START = 'start';
+    const edges = new Map();
+    let tooLarge = false;
+    const addEdge = (from, to, regex) => {
+        if (regex === null) return;
+        if (!edges.has(from)) edges.set(from, new Map());
+        const row = edges.get(from);
+        const merged = row.has(to) ? union(row.get(to), regex) : regex;
+        if (merged.length > ANTI_SLOP_MAX_PATTERN_CHARS) tooLarge = true;
+        row.set(to, merged);
+    };
+    const edge = (from, to) => edges.get(from)?.get(to) ?? null;
+
+    // BFS distance of every state reachable from R or from the prefix state (drives elimination order).
+    const distance = new Map();
+    for (const origin of [ROOT, startState]) {
+        if (distance.has(origin)) continue;
+        distance.set(origin, origin === ROOT ? 0 : 1);
+        const bfs = [origin];
+        while (bfs.length) {
+            const s = bfs.shift();
+            for (const t of states[s].next.values()) {
+                if (t !== DEAD && !distance.has(t)) { distance.set(t, distance.get(s) + 1); bfs.push(t); }
+            }
+        }
     }
 
-    const expr = toRegex(root);
-    if (!expr) return null;
+    const nodeId = (s, asSource) => (s === ROOT ? (asSource ? ROOT_OUT : ROOT_IN) : s);
+    // "Inside an unbanned word" (M). Its boundary transitions are shared by most states, so they live on a
+    // separate node BOUNDARY that those states reach by an empty step: `(other letters)* boundary` then
+    // appears once per state instead of being spelled out twice.
+    const insideWord = stateIndex.get(stateKey([], true));
+    const BOUNDARY = 'boundary';
+    const nonwordSymbols = symbols.filter(sym => !symbolIsWord(sym));
+    const sharesBoundary = (s) => insideWord !== undefined && distance.has(insideWord)
+        && nonwordSymbols.every(sym => states[s].next.get(sym) === states[insideWord].next.get(sym));
+    for (const s of distance.keys()) {
+        const viaBoundary = sharesBoundary(s);
+        const byTarget = new Map();
+        for (const [sym, t] of states[s].next) {
+            if (t === DEAD) continue;
+            if (viaBoundary && !symbolIsWord(sym)) continue;
+            if (!byTarget.has(t)) byTarget.set(t, []);
+            byTarget.get(t).push(sym);
+        }
+        for (const [t, syms] of byTarget) addEdge(nodeId(s, true), nodeId(t, false), labelFor(syms));
+        if (viaBoundary) addEdge(nodeId(s, true), BOUNDARY, '');
+        if (s !== ROOT && s !== insideWord) addEdge(s, END, '');
+    }
+    if (insideWord !== undefined && distance.has(insideWord)) {
+        const byTarget = new Map();
+        for (const sym of nonwordSymbols) {
+            const t = states[insideWord].next.get(sym);
+            if (t === DEAD) continue;
+            if (!byTarget.has(t)) byTarget.set(t, []);
+            byTarget.get(t).push(sym);
+        }
+        for (const [t, syms] of byTarget) addEdge(BOUNDARY, nodeId(t, false), labelFor(syms));
+        addEdge(BOUNDARY, END, '');
+    }
+    if (startState !== ROOT) addEdge(START, startState, '');
+
+    // Elimination order: the inside-word state first, then states farthest from R, and the shared boundary
+    // last, so each trie path ends up nested under its shared prefix and boundary handling appears once.
+    const order = [];
+    if (insideWord !== undefined && distance.has(insideWord)) order.push(insideWord);
+    for (const st of [...distance.keys()].sort((a, b) => distance.get(b) - distance.get(a))) {
+        if (st !== ROOT && st !== insideWord) order.push(st);
+    }
+    if (edges.has(BOUNDARY)) order.push(BOUNDARY);
+    for (const k of order) {
+        if (tooLarge) break;
+        const loop = star(edge(k, k));
+        const outgoing = [...(edges.get(k) ?? new Map()).keys()].filter(to => to !== k);
+        for (const [from, row] of edges) {
+            if (from === k || !row.has(k)) continue;
+            const inRegex = row.get(k);
+            row.delete(k);
+            for (const to of outgoing) addEdge(from, to, concat(inRegex, loop, edge(k, to)));
+        }
+        edges.delete(k);
+    }
+    if (tooLarge) return { pattern: null, error: 'The ban list is too large for a schema pattern; remove some entries.' };
+
+    const cycle = edge(ROOT_OUT, ROOT_IN);
+    const tail = union('', edge(ROOT_OUT, END));
+    const start = startState === ROOT ? '' : edge(START, ROOT_IN);
+    if (cycle === null) return { pattern: null, error: 'The ban list blocks every possible reply.' };
+    if (start === null) return { pattern: null, error: 'Could not continue safely from the prefill.' };
+
+    const patternMode = String(opts.patternMode ?? 'default');
+    // One cycle is roughly a word plus its separator, so convert the character minimum to cycles
+    // (rounded down, so a tiny minimum such as Continue's 1 doesn't demand a word boundary).
+    const minCycles = Math.max(0, Math.floor(Math.trunc(Number(opts.minChars) || 0) / 6));
+    let repeated;
+    if (patternMode === 'anthropic' || minCycles === 0) {
+        // Anthropic rejects large `{n,}` ranges; just require some output.
+        repeated = start || minCycles === 0 ? star(cycle) : `${group(cycle)}+`;
+    } else {
+        repeated = `${group(cycle)}{${minCycles},}`;
+    }
+    const startPart = hasAlt(start) ? group(start) : start;
+    const tailPart = hasAlt(tail) ? group(tail) : tail;
+    let pattern = `${startPart}${repeated}${tailPart}`;
+    if (pattern.length > ANTI_SLOP_TAIL_BUDGET_CHARS && minCycles > 0) {
+        pattern = `${startPart}${repeated}`;
+    }
+    // Without a minimum, a reply may also end before ever reaching a word boundary.
+    const startEnd = startState === ROOT ? null : edge(START, END);
+    if (startEnd !== null && (patternMode === 'anthropic' || minCycles === 0)) {
+        pattern = `(?:${pattern}|${startEnd})`;
+    }
+    if (pattern.length > ANTI_SLOP_MAX_PATTERN_CHARS) {
+        return { pattern: null, error: `The ban list needs a ${pattern.length}-character pattern (limit ${ANTI_SLOP_MAX_PATTERN_CHARS}); remove some entries, especially multi-word phrases.` };
+    }
 
     try {
-        new RegExp(expr);
-    } catch {
-        return null;
+        new RegExp(pattern);
+    } catch (err) {
+        return { pattern: null, error: `Anti-slop pattern failed validation: ${err?.message ?? err}` };
     }
+    return { pattern, error: '' };
+}
+// </anti-slop>
 
-    return expr;
+// Text after the last `[[...]]` slot: the part of the prefix whose exact characters are known.
+function getLiteralTailAfterSlots(prefix) {
+    const text = normalizeNewlines(prefix);
+    const slotRe = /\[\[[^\]]+?\]\]/g;
+    let tailStart = 0;
+    let m;
+    while ((m = slotRe.exec(text)) !== null) tailStart = m.index + m[0].length;
+    return text.slice(tailStart);
 }
 
 function buildPatternResponseSchema(prefix, opts = {}) {
@@ -576,33 +868,53 @@ function buildPatternResponseSchema(prefix, opts = {}) {
         prefixRegex = escapeRegexSourceForAsciiPattern(prefixRegex);
     }
 
-    if (joinSuffixRegex) {
+    // Anti-slop: the continuation must never spell a banned entry, including across the prefix boundary.
+    let antiSlopExpr = null;
+    if (!mustEndAfterTemplate) {
+        const antiSlop = buildAntiSlopContinuation(opts.antiSlopBanList, {
+            minChars,
+            patternMode,
+            prefixText: getLiteralTailAfterSlots(prefix),
+        });
+        if (antiSlop.error) console.warn(`[StructuredPrefill] Anti-slop disabled for this request: ${antiSlop.error}`);
+        antiSlopExpr = antiSlop.pattern;
+        if (antiSlopExpr && patternMode === 'anthropic') {
+            antiSlopExpr = escapeRegexSourceForAsciiPattern(antiSlopExpr);
+        }
+    }
+
+    // The anti-slop automaton must see every character after the prefix, so skip the Continue join char with it.
+    if (joinSuffixRegex && !antiSlopExpr) {
         prefixRegex += joinSuffixRegex;
     }
 
-    const defaultAnyChar = anyCharIncludingNewlineExpr();
-    const antiSlopExpr = buildAntiSlopContinuation(opts.antiSlopBanList);
-    const anyChar = antiSlopExpr || defaultAnyChar;
-    let pattern = '';
-    if (mustEndAfterTemplate) {
-        let trailing = '[\\t \\r\\n]*';
-        if (newlineToken && /^[\x00-\x7F]*$/.test(newlineToken)) {
-            const escapedToken = escapeRegExp(newlineToken);
-            trailing = `[\\t ]*(?:${escapedToken}|\\n)?(?:[\\t ]*(?:${escapedToken}|\\n)[\\t ]*)*`;
+    const anyChar = anyCharIncludingNewlineExpr();
+    const buildPattern = (prefixSource) => {
+        if (mustEndAfterTemplate) {
+            let trailing = '[\\t \\r\\n]*';
+            if (newlineToken && /^[\x00-\x7F]*$/.test(newlineToken)) {
+                const escapedToken = escapeRegExp(newlineToken);
+                trailing = `[\\t ]*(?:${escapedToken}|\\n)?(?:[\\t ]*(?:${escapedToken}|\\n)[\\t ]*)*`;
+            }
+            return `^(?:${prefixSource})${trailing}$`;
         }
-        pattern = `^(?:${prefixRegex})${trailing}$`;
-    } else if (patternMode === 'anthropic') {
-        pattern = `^(?:${prefixRegex})${anyChar}+$`;
-    } else {
-        pattern = `^(?:${prefixRegex})${anyChar}{${minChars},}$`;
-    }
+        if (antiSlopExpr) return `^(?:${prefixSource})${antiSlopExpr}$`;
+        if (patternMode === 'anthropic') return `^(?:${prefixSource})${anyChar}+$`;
+        return `^(?:${prefixSource})${anyChar}{${minChars},}$`;
+    };
 
+    let pattern = buildPattern(prefixRegex);
+    // A bad [[re:...]] slot must not brick generation: fall back to enforcing the prefill literally.
     try {
         new RegExp(pattern);
     } catch {
-        pattern = mustEndAfterTemplate
-            ? `^(?:${prefixRegex})[\\t \\r\\n]*$`
-            : `^(?:${prefixRegex})${patternMode === 'anthropic' ? anyChar + '+' : `${anyChar}{${minChars},}`}$`;
+        let literal = escapePrefixLiteral(wirePrefix);
+        if (newlineToken) {
+            const escapedToken = escapeRegExp(newlineToken);
+            literal = literal.split(escapedToken).join(`(?:${escapedToken}|\\n)`);
+        }
+        if (patternMode === 'anthropic') literal = escapeRegexSourceForAsciiPattern(literal);
+        pattern = buildPattern(literal);
     }
 
     return {
@@ -615,40 +927,6 @@ function buildPatternResponseSchema(prefix, opts = {}) {
             },
         },
         required: ['response'],
-        additionalProperties: false,
-    };
-}
-
-function buildEnumResponseSchema(prefix, opts = {}) {
-    if (opts.mustEndAfterTemplate) {
-        return {
-            type: 'object',
-            properties: {
-                response: {
-                    type: 'string',
-                    enum: [String(prefix ?? '')],
-                    description: '',
-                },
-            },
-            required: ['response'],
-            additionalProperties: false,
-        };
-    }
-
-    return {
-        type: 'object',
-        properties: {
-            prefix: {
-                type: 'string',
-                enum: [String(prefix ?? '')],
-                description: '',
-            },
-            response: {
-                type: 'string',
-                description: '',
-            },
-        },
-        required: ['prefix', 'response'],
         additionalProperties: false,
     };
 }
@@ -2145,6 +2423,7 @@ function createUsageText(port) {
 
 module.exports = {
     DEFAULT_PROXY_CONFIG,
+    buildAntiSlopContinuation,
     buildPatternResponseSchema,
     createUsageText,
     decodeNewlines,

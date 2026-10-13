@@ -37,9 +37,11 @@
                     <div class="flex-container">
                         <label class="flex-container">
                             <input type="checkbox" id="structuredprefill_enabled">
-                            <small>Enabled StructuredPrefill</small>
+                            <small>Enable StructuredPrefill</small>
                         </label>
                     </div>
+
+                    <div id="structuredprefill_status" class="structuredprefill-status"></div>
 
                     <div class="flex-container">
                         <label class="flex-container">
@@ -52,42 +54,36 @@
 
             <div class="structuredprefill-settings-group inline-drawer">
                 <div class="inline-drawer-toggle inline-drawer-header structuredprefill-section-toggle">
-                    <span class="structuredprefill-section-label">Prefill Override</span>
-                    <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+                    <span class="structuredprefill-section-label">Prefill</span>
+                    <div class="inline-drawer-icon fa-solid fa-circle-chevron-up up"></div>
                 </div>
 
-                <div class="inline-drawer-content structuredprefill-section-content">
+                <div class="inline-drawer-content structuredprefill-section-content" style="display:block;">
                     <div class="flex-container">
                         <label class="flex-container">
                             <input type="checkbox" id="structuredprefill_override_prefill_enabled">
-                            <small>Use this preset's prefill instead of Prompt Manager / assistant prefill</small>
+                            <small>Use this prefill (works with any preset)</small>
                         </label>
                     </div>
 
                     <div class="flex-container flexFlowColumn">
-                        <label for="structuredprefill_override_prefill_text">Structured prefill text</label>
                         <textarea id="structuredprefill_override_prefill_text" class="text_pole" rows="6" autocomplete="off" placeholder="[here is the response:]"></textarea>
-                        <small>If no assistant prefill exists, StructuredPrefill appends this one for the outgoing request. If one already exists, it is replaced by this preset value.</small>
+                        <small>When unchecked, the preset's own prefill is used instead: a trailing assistant prompt in the Prompt Manager, or "Start Claude's answer with".</small>
                     </div>
                 </div>
             </div>
 
             <div class="structuredprefill-settings-group inline-drawer">
                 <div class="inline-drawer-toggle inline-drawer-header structuredprefill-section-toggle">
-                    <span class="structuredprefill-section-label">Schema</span>
+                    <span class="structuredprefill-section-label">Anti-Slop</span>
                     <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
                 </div>
 
                 <div class="inline-drawer-content structuredprefill-section-content">
                     <div class="flex-container flexFlowColumn">
-                        <label for="structuredprefill_min_chars_after_prefix">Minimum characters after prefix</label>
-                        <input id="structuredprefill_min_chars_after_prefix" class="text_pole" type="number" min="1" max="10000" step="1" autocomplete="off">
-                        <small>Normal generations only. Continue uses its own minimal constraint.</small>
-                    </div>
-
-                    <div class="flex-container flexFlowColumn">
-                        <label for="structuredprefill_newline_token">Newline token (encoded in schema)</label>
-                        <input id="structuredprefill_newline_token" class="text_pole" type="text" autocomplete="off" placeholder="\n">
+                        <label for="structuredprefill_anti_slop_ban_list">Banned words (one per line)</label>
+                        <textarea id="structuredprefill_anti_slop_ban_list" class="text_pole" rows="6" placeholder="ozone&#10;Elara&#10;&mdash;" autocomplete="off"></textarea>
+                        <small>Case-insensitive. A word is blocked wherever a word starts with it (<code>gaze</code> blocks gazed and gazelle, not stargaze); punctuation like <code>&mdash;</code> is blocked everywhere. Multi-word phrases make the schema much larger.</small>
                     </div>
                 </div>
             </div>
@@ -160,29 +156,27 @@
 
             <div class="structuredprefill-settings-group inline-drawer">
                 <div class="inline-drawer-toggle inline-drawer-header structuredprefill-section-toggle">
-                    <span class="structuredprefill-section-label">Continue</span>
+                    <span class="structuredprefill-section-label">Advanced</span>
                     <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
                 </div>
 
                 <div class="inline-drawer-content structuredprefill-section-content">
                     <div class="flex-container flexFlowColumn">
-                        <label for="structuredprefill_continue_overlap_chars">Overlap characters</label>
-                        <input id="structuredprefill_continue_overlap_chars" class="text_pole" type="number" min="0" max="120" step="1" autocomplete="off">
+                        <label for="structuredprefill_min_chars_after_prefix">Minimum characters after prefix</label>
+                        <input id="structuredprefill_min_chars_after_prefix" class="text_pole" type="number" min="1" max="10000" step="1" autocomplete="off">
+                        <small>Normal generations only. Continue uses its own minimal constraint.</small>
                     </div>
-                    <small><code>[[pg]]</code> is not used for Continue.</small>
-                </div>
-            </div>
 
-            <div class="structuredprefill-settings-group inline-drawer">
-                <div class="inline-drawer-toggle inline-drawer-header structuredprefill-section-toggle">
-                    <span class="structuredprefill-section-label">Anti-Slop</span>
-                    <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
-                </div>
-
-                <div class="inline-drawer-content structuredprefill-section-content">
                     <div class="flex-container flexFlowColumn">
-                        <label for="structuredprefill_anti_slop_ban_list">Banned words (one per line)</label>
-                        <textarea id="structuredprefill_anti_slop_ban_list" class="text_pole" rows="6" placeholder="ozone&#10;Elara&#10;&mdash;" autocomplete="off"></textarea>
+                        <label for="structuredprefill_continue_overlap_chars">Continue overlap characters</label>
+                        <input id="structuredprefill_continue_overlap_chars" class="text_pole" type="number" min="0" max="120" step="1" autocomplete="off">
+                        <small>How much of the existing message the model must repeat on Continue. 0 = no overlap. <code>[[pg]]</code> is not used for Continue.</small>
+                    </div>
+
+                    <div class="flex-container flexFlowColumn">
+                        <label for="structuredprefill_newline_token">Newline token (encoded in schema)</label>
+                        <input id="structuredprefill_newline_token" class="text_pole" type="text" autocomplete="off" placeholder="\n">
+                        <small>Only change this if your prefill literally contains the token text.</small>
                     </div>
                 </div>
             </div>
@@ -196,7 +190,7 @@
                 <div class="inline-drawer-content structuredprefill-section-content">
                     <div class="flex-container flexFlowColumn">
                         <small>
-                            Docs: <a href="https://rentry.org/structuredprefill" target="_blank" rel="noopener noreferrer">rentry.org/structuredprefill</a>
+                            Docs: <a href="https://github.com/Cheesedozer/StructuredPrefill-Cheesedozer-Edition#readme" target="_blank" rel="noopener noreferrer">README on GitHub</a>
                         </small>
                     </div>
                 </div>
