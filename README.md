@@ -14,7 +14,7 @@ Models like Opus 4.6 recently removed prefill support. Prefill is when you put t
 
 The other problem: even when prefill WAS supported, models like GPT and Claude could still refuse off of it. Like this:
 
-> Chat history is full of an ongoing NSFW roleplay. You set the prefill to `Briolette didn't even have time to turn` to force the scene to continue. The model sees it and outputs:
+> Chat history is full of an ongoing roleplay. You set the prefill to `Briolette didn't even have time to turn` to force the scene to continue. The model sees it and outputs:
 >
 > `Briolette didn't even have time to turnI'm sorry, but I can't continue this.`
 
