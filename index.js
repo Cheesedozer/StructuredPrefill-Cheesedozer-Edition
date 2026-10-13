@@ -122,6 +122,8 @@ const runtimeState = {
     },
     // Shown in the status line: which prefill the last generation used, or why none was used.
     lastPrefillReport: '',
+    // Regex for the full prefill, used to check after the reply whether the provider enforced it.
+    prefillCheckRegex: null,
 };
 
 function clearPostStopDomFixTimer() {
@@ -3157,6 +3159,7 @@ async function injectStructuredPrefill(generateData, settings) {
     resetStreamGuard();
     clearHidePrefillState();
     clearContinueState();
+    runtimeState.prefillCheckRegex = null;
 
     // Reset per-generation targeting so we don't apply to an unrelated swipe.
     runtimeState.trackedSwipeId = -1;
@@ -3324,6 +3327,11 @@ async function injectStructuredPrefill(generateData, settings) {
             // The stripper must match straight quotes in the decoded text.
             buildPrefillStripper(straightenCurlyQuotes(schemaPrefix));
         }
+        try {
+            runtimeState.prefillCheckRegex = new RegExp(`^(?:${buildPrefixRegexFromWireTemplate(straightenCurlyQuotes(schemaPrefix))})`);
+        } catch {
+            runtimeState.prefillCheckRegex = null;
+        }
     }
 
     // User constraint (repo-local): do not insert any new "nudge" message content.
@@ -3392,6 +3400,7 @@ async function injectStructuredPrefill(generateData, settings) {
     reportPrefill(isContinue
         ? 'Continue (enforced through the schema).'
         : `prefill from ${prefillSource}: "${previewPrefill(tailContent)}"`);
+    console.info(`[${extensionName}] ACTIVE: schema sent to ${src} / ${modelId}. Hide prefill: ${settings.hide_prefill_in_display ? 'on' : 'off'}. Waiting for the reply to check it...`);
 
     // If this generation updates an existing assistant message (e.g., swipes), seed the fallback with the
     // currently displayed content so early-abort / early-token cases don't blank the message.
@@ -3443,6 +3452,7 @@ function onMessageReceived(messageId) {
     const raw = getRawCandidateForMessage(messageId);
     const unwrapped = tryUnwrapStructuredOutput(String(raw));
     if (typeof unwrapped === 'string') runtimeState.lastAppliedText = unwrapped;
+    checkReplyAgainstPrefill(unwrapped);
     applyTextToMessage(messageId, (typeof unwrapped === 'string' ? unwrapped : chat?.[messageId]?.mes ?? ''), { forceRerender: true });
 
     runtimeState.active = false;
@@ -3476,12 +3486,49 @@ function onGenerationStopped() {
     touchStopCleanup(messageId, runtimeState.stopSessionAt);
 }
 
+// Tells the user, in the console and status line, whether the provider actually enforced the prefill.
+function checkReplyAgainstPrefill(unwrapped) {
+    const regex = runtimeState.prefillCheckRegex;
+    runtimeState.prefillCheckRegex = null;
+    if (runtimeState.continue.active) return;
+
+    const tag = `[${extensionName}]`;
+    const addToStatus = (suffix) => {
+        runtimeState.lastPrefillReport = `${runtimeState.lastPrefillReport} ${suffix}`;
+        renderStatus();
+    };
+    if (typeof unwrapped !== 'string') {
+        console.warn(`${tag} NOT WORKING: the reply was not the expected JSON, so the provider ignored the schema and the prefill was not enforced.`);
+        addToStatus('NOT enforced: the provider ignored the schema.');
+        return;
+    }
+    if (!(regex instanceof RegExp)) return;
+
+    const text = normalizeNewlines(unwrapped);
+    if (!regex.test(text)) {
+        console.warn(`${tag} NOT WORKING: the reply does not start with the prefill, so the provider treated it as a suggestion.\n  Reply starts with: "${previewPrefill(text, 120)}"`);
+        addToStatus('NOT enforced: the reply did not start with it.');
+        return;
+    }
+
+    let hideNote = 'Hide prefill is off, so the prefill stays in the message (expected).';
+    if (extension_settings[extensionName]?.hide_prefill_in_display) {
+        const hidden = maybeHidePrefillForDisplay(unwrapped) !== text;
+        hideNote = hidden
+            ? 'Hide prefill is on and the prefill was removed from the message.'
+            : 'Hide prefill is on, but the hidden part was empty (is [[keep]] at the very start?) so nothing was removed.';
+    }
+    console.info(`${tag} WORKING: the reply starts with the prefill, so the provider enforced it. ${hideNote}`);
+    addToStatus('Enforced.');
+}
+
 function previewPrefill(text, max = 60) {
     const flat = String(text ?? '').replace(/\s+/g, ' ').trim();
     return flat.length > max ? `${flat.slice(0, max)}…` : flat;
 }
 
 function reportPrefill(text) {
+    if (text !== runtimeState.lastPrefillReport) console.info(`[${extensionName}] Last reply: ${text}`);
     runtimeState.lastPrefillReport = text;
     renderStatus();
 }

@@ -150,6 +150,8 @@ Continue normally uses prefill, so it errors or refuses on the same models. Stru
 
 | Problem | Fix |
 |---|---|
+| Is it actually working? | After a reply, the status line ends with **Enforced** or **NOT enforced**. The browser console (F12) shows `[StructuredPrefill] WORKING` or `NOT WORKING` with the reason. |
+| The prefill shows up in the reply | Expected unless **Hide prefill text** is on: the model writes the prefill itself. Turn hiding on (use `[[keep]]` to keep part of it). If it's on and the console says NOT WORKING, the provider didn't enforce the prefill. |
 | Status says **Inactive** | Read the reason it gives. Usually: not a Chat Completion API, or the provider can't enforce structured outputs (see [Compatibility](#compatibility)). |
 | My preset's prefill isn't used | Check the status line's **Last reply** line; it says why. The prefill must be **assistant** role and the **last** prompt (nothing user-role below it). Or tick **Use this prefill** and paste it in. |
 | Nothing happens in group chats | The last message is the previous character's reply, which is chat history, not a prefill. Set a prefill in the box. |
